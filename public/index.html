@@ -238,6 +238,9 @@
             <button id="btn-restart-round" class="px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 text-xs font-semibold flex items-center gap-1 border border-emerald-500/30 transition">
               <span>🔄</span> Ronde Baru
             </button>
+            <button id="btn-game-lobby" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 border border-slate-700 transition" title="Kembali ke Lobby (Meja tetap berjalan)">
+              <span>🚪</span> Lobby
+            </button>
             <button id="btn-game-delete-room" class="px-2.5 py-1 rounded-lg bg-rose-600/25 hover:bg-rose-600 text-rose-200 text-xs font-semibold flex items-center gap-1 border border-rose-500/40 transition">
               <span>🗑️</span> Hapus
             </button>
@@ -326,9 +329,14 @@
           <span>💬</span>
           <span id="chat-room-title" class="text-xs font-bold text-amber-300 truncate">Chat Ruangan</span>
         </div>
-        <button id="btn-close-chat" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">
-          <span class="text-xs font-bold leading-none">✕</span>
-        </button>
+        <div class="flex items-center gap-1.5">
+          <button id="btn-clear-chat" title="Bersihkan riwayat chat ruangan" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold border border-slate-600">
+            🧹 Bersihkan
+          </button>
+          <button id="btn-close-chat" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">
+            <span class="text-xs font-bold leading-none">✕</span>
+          </button>
+        </div>
       </div>
 
       <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2.5 text-xs"></div>

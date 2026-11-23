@@ -594,6 +594,7 @@ function handleServerEvent(type, payload) {
   } else if (type === 'GAME_START') {
     SFX.card();
     showToast('Permainan dimulai!', 'success');
+    clearChatHistory();
     switchToGameView();
   } else if (type === 'GAME_UPDATE') {
     SFX.card();
@@ -604,6 +605,7 @@ function handleServerEvent(type, payload) {
     if (app.sseSource) app.sseSource.close();
     app.currentRoom = null;
     app.game = null;
+    clearChatHistory();
     switchView('lobby');
     refreshRoomsList();
   } else if (type === 'GAME_OVER') {
@@ -695,9 +697,14 @@ async function joinRoom(roomIdent, password = '') {
   if (nameInput && nameInput.value.trim() && nameInput.value.trim() !== app.player.name) {
     await renamePlayer(nameInput.value.trim());
   }
+
+  // Clear chat history so every new room starts with fresh chat history
+  clearChatHistory();
+
   showToast('Menghubungkan ke ruangan...', 'info');
   const res = await apiPost(`/api/rooms/${roomIdent}/join`, {
     playerId: app.player.id,
+    playerName: app.player.name,
     password
   });
 
@@ -711,6 +718,10 @@ async function joinRoom(roomIdent, password = '') {
   app.mySeat = res.seat;
   app.lastEventId = 0;
   connectRoomSSE(res.room.id);
+
+  if (res.reconnected) {
+    showToast(`Terhubung kembali ke meja sebagai "${app.player.name}"!`, 'success');
+  }
 
   if (res.room.status === 'playing') {
     switchToGameView();
@@ -1151,6 +1162,7 @@ async function deleteCurrentRoom() {
     if (app.sseSource) app.sseSource.close();
     app.currentRoom = null;
     app.game = null;
+    clearChatHistory();
     switchView('lobby');
     refreshRoomsList();
   } else {
@@ -1246,6 +1258,14 @@ function sendEmote(emote) {
     seat: app.mySeat,
     emote
   });
+}
+
+function clearChatHistory() {
+  const container = document.getElementById('chat-messages');
+  if (container) container.innerHTML = '';
+  app.unreadChat = 0;
+  const badge = document.getElementById('chat-unread-badge');
+  if (badge) badge.classList.add('hidden');
 }
 
 function addChatMessage(sender, avatar, text) {
@@ -1610,13 +1630,26 @@ window.addEventListener('DOMContentLoaded', async () => {
     await apiPost(`/api/rooms/${app.currentRoom.id}/leave`, { playerId: app.player.id });
     if (app.sseSource) app.sseSource.close();
     app.currentRoom = null;
+    clearChatHistory();
     switchView('lobby');
     refreshRoomsList();
   });
 
   document.getElementById('btn-back-lobby').addEventListener('click', () => {
+    clearChatHistory();
     switchView('lobby');
     refreshRoomsList();
+  });
+
+  document.getElementById('btn-game-lobby')?.addEventListener('click', () => {
+    clearChatHistory();
+    switchView('lobby');
+    refreshRoomsList();
+  });
+
+  document.getElementById('btn-clear-chat')?.addEventListener('click', () => {
+    clearChatHistory();
+    showToast('Histori chat dibersihkan', 'info');
   });
 
   // Chat Panel Toggle & Submit

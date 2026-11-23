@@ -552,11 +552,11 @@ app.get('/api/rooms/:id/sync', async (req, res) => {
   }
 });
 
-// 7. Join Room
+// 7. Join Room / Reconnect to Room
 app.post('/api/rooms/:id/join', async (req, res) => {
   try {
     const roomIdent = req.params.id;
-    const { playerId, password } = req.body;
+    const { playerId, playerName, password } = req.body;
     if (!playerId) return res.status(400).json({ error: 'Player ID required' });
 
     const roomRes = await query('SELECT * FROM rooms WHERE id = $1 OR code = $1', [roomIdent]);
@@ -567,23 +567,95 @@ app.post('/api/rooms/:id/join', async (req, res) => {
       return res.status(403).json({ error: 'Password ruangan salah!' });
     }
 
+    // Resolve player's effective name and profile
+    let effectiveName = playerName ? String(playerName).trim().slice(0, 24) : '';
+    const playerInfo = await query('SELECT id, name, avatar, frame FROM players WHERE id = $1', [playerId]);
+    if (playerInfo.rows.length > 0 && playerInfo.rows[0].name) {
+      effectiveName = playerInfo.rows[0].name.trim();
+    } else if (effectiveName) {
+      // Ensure player row exists in DB
+      await query(
+        `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
+         VALUES ($1, $2, '🦊', 'border-amber-400', 'skin-royal', 'table-emerald', 2500, 2500, 0, 0, NOW())
+         ON CONFLICT (id) DO UPDATE SET name = $2, last_active_at = NOW()`,
+        [playerId, effectiveName]
+      );
+    }
+
+    // Fetch all current seated players in this room
+    const currentSeatsRes = await query(`
+      SELECT rp.seat, rp.player_id, rp.is_ready, rp.is_host, rp.is_bot, rp.bot_profile,
+             COALESCE(p.name, rp.bot_profile->>'name') as name,
+             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar
+      FROM room_players rp
+      LEFT JOIN players p ON rp.player_id = p.id
+      WHERE rp.room_id = $1
+      ORDER BY rp.seat ASC
+    `, [room.id]);
+
+    // Check if player is already seated in this room:
+    // Match 1: By exact playerId
+    let matchedSeat = currentSeatsRes.rows.find(r => r.player_id === playerId);
+
+    // Match 2: By matching name (case-insensitive) if not already matched
+    if (!matchedSeat && effectiveName) {
+      matchedSeat = currentSeatsRes.rows.find(r =>
+        r.name && r.name.trim().toLowerCase() === effectiveName.toLowerCase()
+      );
+    }
+
+    // IF MATCHED: Player is reconnecting / reclaiming their existing seat!
+    if (matchedSeat) {
+      const targetSeat = matchedSeat.seat;
+
+      // If playerId changed (new tab / reconnected with same name), update room_players and game_states
+      if (matchedSeat.player_id !== playerId) {
+        await query(
+          'UPDATE room_players SET player_id = $1, is_bot = FALSE WHERE room_id = $2 AND seat = $3',
+          [playerId, room.id, targetSeat]
+        );
+
+        if (matchedSeat.is_host) {
+          await query('UPDATE rooms SET host_id = $1 WHERE id = $2', [playerId, room.id]);
+        }
+
+        // Also update playerId in active game_states if game is running
+        const gsRes = await query('SELECT state, version FROM game_states WHERE room_id = $1', [room.id]);
+        if (gsRes.rows.length > 0 && gsRes.rows[0].state) {
+          const g = gsRes.rows[0].state;
+          if (g.players && g.players[targetSeat]) {
+            g.players[targetSeat].playerId = playerId;
+            g.players[targetSeat].name = effectiveName || g.players[targetSeat].name;
+            g.players[targetSeat].isBot = false;
+            await query(
+              'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
+              [JSON.stringify(g), room.id]
+            );
+          }
+        }
+      }
+
+      await recordRoomEvent(room.id, 'PLAYER_JOINED', {
+        playerId,
+        name: effectiveName || matchedSeat.name,
+        seat: targetSeat,
+        reconnected: true
+      });
+
+      return res.json({ ok: true, room, seat: targetSeat, reconnected: true });
+    }
+
+    // IF NOT MATCHED: New player joining.
+    // Cannot join new seat if game is already in progress
     if (room.status !== 'waiting') {
       return res.status(400).json({ error: 'Permainan di ruangan ini sudah dimulai atau selesai!' });
     }
 
-    // Check if already in room
-    const existing = await query('SELECT * FROM room_players WHERE room_id = $1 AND player_id = $2', [room.id, playerId]);
-    if (existing.rows.length > 0) {
-      return res.json({ ok: true, room, seat: existing.rows[0].seat });
-    }
-
-    // Find first empty seat
-    const currentSeats = await query('SELECT seat FROM room_players WHERE room_id = $1 ORDER BY seat ASC', [room.id]);
-    if (currentSeats.rows.length >= room.max_players) {
+    if (currentSeatsRes.rows.length >= room.max_players) {
       return res.status(400).json({ error: 'Ruangan sudah penuh!' });
     }
 
-    const taken = new Set(currentSeats.rows.map(r => r.seat));
+    const taken = new Set(currentSeatsRes.rows.map(r => r.seat));
     let targetSeat = -1;
     for (let i = 0; i < room.max_players; i++) {
       if (!taken.has(i)) {
@@ -598,8 +670,7 @@ app.post('/api/rooms/:id/join', async (req, res) => {
       [room.id, playerId, targetSeat]
     );
 
-    const playerInfo = await query('SELECT name, avatar FROM players WHERE id = $1', [playerId]);
-    const pName = playerInfo.rows[0]?.name || 'Pemain';
+    const pName = effectiveName || 'Pemain';
 
     await recordRoomEvent(room.id, 'PLAYER_JOINED', {
       playerId,
