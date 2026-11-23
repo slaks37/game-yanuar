@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Carena 16-Bit — Online PvP Multiplayer Kartu</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
-  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="stylesheet" href="/css/style.css?v=ai-move-20261123" />
 </head>
 <body class="min-h-screen flex flex-col skin-royal table-emerald" id="app-body">
 
@@ -254,6 +254,13 @@
           <!-- Opponents Row -->
           <div id="opponents-container" class="relative z-10 flex flex-wrap items-start justify-center gap-2 sm:gap-3 pt-1">
             <!-- Rendered by JS -->
+          </div>
+
+          <!-- Live AI move strip: each committed bot step appears in sequence. -->
+          <div id="ai-move-stream" class="relative z-10 mx-auto my-1 w-full max-w-xl bg-slate-950/85 border border-amber-400/50 px-2.5 py-2 text-center">
+            <div class="text-[10px] font-bold tracking-wide text-amber-300">LANGKAH KARTU AI · LIVE</div>
+            <div id="ai-move-live" aria-live="polite" class="mt-1 text-[11px] text-slate-300">Menunggu langkah AI berikutnya...</div>
+            <div id="ai-move-history" class="ai-move-history mt-2 text-[10px] text-slate-400 text-left" aria-label="Riwayat langkah AI"></div>
           </div>
 
           <!-- Center Table Board -->
@@ -570,6 +577,6 @@
   <div id="toast-container" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 pointer-events-none"></div>
 
   <!-- CLIENT JAVASCRIPT -->
-  <script src="/js/app.js"></script>
+  <script src="/js/app.js?v=ai-move-20261123"></script>
 </body>
 </html>

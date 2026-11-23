@@ -403,48 +403,124 @@ function applyCosmetics() {
   body.classList.add(app.player.tableSkin);
 }
 
-// ==================== HEARTBEAT SYNC LOOP (100% RELIABLE PVP) ====================
+// ==================== EVENT-BASED AI MOVE PLAYBACK ====================
 let isSyncInProgress = false;
 let botStepTimer = null;
+let botStepInFlight = false;
+let scheduledBotKey = null;
+let gameSyncPromise = null;
+let actionInFlight = false;
+const seenEventIds = new Set();
+const aiMoveQueue = [];
+const aiMoveHistory = [];
+let aiMoveTimer = null;
+
+function resetAiMovePlayback() {
+  aiMoveQueue.length = 0;
+  aiMoveHistory.length = 0;
+  if (aiMoveTimer) clearTimeout(aiMoveTimer);
+  aiMoveTimer = null;
+  const live = document.getElementById('ai-move-live');
+  const history = document.getElementById('ai-move-history');
+  if (live) live.textContent = 'Menunggu langkah AI berikutnya...';
+  if (history) history.innerHTML = '';
+}
+
+function playNextAiMove() {
+  if (aiMoveTimer || !aiMoveQueue.length || app.view !== 'game') return;
+  const move = aiMoveQueue.shift();
+  const live = document.getElementById('ai-move-live');
+  const history = document.getElementById('ai-move-history');
+  if (!live || !history) return;
+  const cards = (Array.isArray(move.cards) ? move.cards : [])
+    .filter(c => c && RANKS.includes(c.rank) && SUITS.includes(c.suit)).slice(0, 5);
+  const faceDownCount = Math.min(5, Math.max(0, Number(move.faceDownCount) || 0));
+  const visibleCards = cards.map((card, i) => cardHTML(card, { small: true, extraClass: 'ai-card-enter' })).join('');
+  const hiddenCards = Array.from({ length: faceDownCount }, () =>
+    cardHTML(null, { small: true, faceDown: true, extraClass: 'ai-card-enter' })).join('');
+  const name = escapeHtml(move.name || 'AI');
+  const action = escapeHtml(move.text || move.action || 'Memainkan kartu');
+  live.innerHTML = `<div class="flex flex-wrap justify-center items-center gap-2">
+    <span class="text-amber-300 font-extrabold text-xs">🤖 ${name}</span>
+    <span class="text-slate-200 text-[11px]">${action}</span>
+  </div>
+  <div class="flex justify-center items-center gap-1.5 mt-2">${visibleCards}${hiddenCards}</div>`;
+  aiMoveHistory.unshift({ name: move.name || 'AI', text: move.text || move.action || 'Jalan' });
+  if (aiMoveHistory.length > 5) aiMoveHistory.pop();
+  history.innerHTML = aiMoveHistory.map(item =>
+    `<div class="truncate"><strong class="text-amber-300">${escapeHtml(item.name)}</strong> · ${escapeHtml(item.text)}</div>`
+  ).join('');
+  SFX.card();
+  aiMoveTimer = setTimeout(() => {
+    aiMoveTimer = null;
+    playNextAiMove();
+  }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 650 : 1100);
+}
+
+function ingestRoomEvents(events, latestEventId = null) {
+  for (const ev of (events || [])) {
+    const id = Number(ev.id || 0);
+    if (id && seenEventIds.has(id)) continue;
+    if (id) {
+      seenEventIds.add(id);
+      if (seenEventIds.size > 250) seenEventIds.delete(seenEventIds.values().next().value);
+    }
+    handleServerEvent(ev.event_type || ev.type, ev.payload || {});
+  }
+  // SSE does not move this cursor: polling will still fetch missed events, then dedupe.
+  if (latestEventId != null) app.lastEventId = Math.max(app.lastEventId, Number(latestEventId) || 0);
+}
+
+function applyGameSnapshot(res) {
+  if (!res || !res.ok || !res.game) return false;
+  const version = Number(res.version || 0);
+  if (!app.game || version > Number(app.gameVersion || 0)) {
+    app.game = res.game;
+    app.gameVersion = version;
+    if (res.mySeat !== undefined && res.mySeat !== -1) app.mySeat = res.mySeat;
+    renderGameTable();
+    return true;
+  }
+  app.game.turnStartedAt = res.game.turnStartedAt;
+  app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
+  updateTurnTimersOnly();
+  return false;
+}
 
 function scheduleBotStepIfNeeded() {
-  if (app.view !== 'game' || !app.currentRoom || !app.game || app.game.finished) {
-    if (botStepTimer) { clearTimeout(botStepTimer); botStepTimer = null; }
+  const game = app.game;
+  const player = game?.players?.[game.turn];
+  const bot = player && (player.isBot || String(player.playerId || '').startsWith('bot_'));
+  if (app.view !== 'game' || !app.currentRoom || !game || game.finished || !bot) {
+    if (botStepTimer) clearTimeout(botStepTimer);
+    botStepTimer = null;
+    scheduledBotKey = null;
     return;
   }
-
-  const currentPl = app.game.players ? app.game.players[app.game.turn] : null;
-  if (!currentPl) return;
-
-  const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
-  if (isBot) {
-    if (botStepTimer) clearTimeout(botStepTimer);
-    botStepTimer = setTimeout(async () => {
-      botStepTimer = null;
-      if (app.view !== 'game' || !app.currentRoom) return;
-      try {
-        const res = await apiPost(`/api/game/${app.currentRoom.id}/bot-step`, {
-          playerId: app.player.id
-        });
-        if (res.ok && res.game) {
-          const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
-          if (isNewVersion) {
-            app.game = res.game;
-            app.gameVersion = res.version || app.gameVersion;
-            if (res.mySeat !== undefined && res.mySeat !== -1) {
-              app.mySeat = res.mySeat;
-            }
-            SFX.card();
-            renderGameTable();
-          }
-        }
-      } catch (err) {
-        console.warn('Bot step error:', err);
-      }
-    }, 850);
-  } else {
-    if (botStepTimer) { clearTimeout(botStepTimer); botStepTimer = null; }
-  }
+  const roomId = app.currentRoom.id;
+  const key = [roomId, app.gameVersion, game.turn, game.phase || ''].join(':');
+  if (key === scheduledBotKey || botStepInFlight) return;
+  if (botStepTimer) clearTimeout(botStepTimer);
+  scheduledBotKey = key;
+  const delay = Math.max(100, 1350 - (Date.now() - (game.turnStartedAt || Date.now())));
+  botStepTimer = setTimeout(async () => {
+    botStepTimer = null;
+    if (app.view !== 'game' || app.currentRoom?.id !== roomId || scheduledBotKey !== key || botStepInFlight) {
+      scheduledBotKey = null;
+      return;
+    }
+    botStepInFlight = true;
+    try {
+      const res = await apiPost(`/api/game/${roomId}/bot-step`, { playerId: app.player.id });
+      if (app.currentRoom?.id === roomId && app.view === 'game') applyGameSnapshot(res);
+    } catch (err) {
+      console.warn('Bot step failed:', err);
+    } finally {
+      botStepInFlight = false;
+      scheduledBotKey = null;
+      if (app.currentRoom?.id === roomId && app.view === 'game') scheduleBotStepIfNeeded();
+    }
+  }, delay);
 }
 
 function updateTurnTimersOnly() {
@@ -479,96 +555,55 @@ function updateTurnTimersOnly() {
   }
 }
 
-async function triggerImmediateGameSync() {
+// GET endpoints do not run AI; share one in-flight request for polling and SSE.
+async function syncGameNow() {
+  if (gameSyncPromise) return gameSyncPromise;
   if (app.view !== 'game' || !app.currentRoom) return;
-  try {
-    const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
-    if (res.ok && res.game) {
-      const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
-      if (isNewVersion) {
-        app.game = res.game;
-        app.gameVersion = res.version || app.gameVersion;
-        if (res.mySeat !== undefined && res.mySeat !== -1) {
-          app.mySeat = res.mySeat;
-        }
-        renderGameTable();
-      } else if (app.game) {
-        app.game.turnStartedAt = res.game.turnStartedAt;
-        app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
-        updateTurnTimersOnly();
-      }
+  const roomId = app.currentRoom.id;
+  gameSyncPromise = (async () => {
+    const res = await apiGet(`/api/game/${roomId}/sync?playerId=${encodeURIComponent(app.player.id)}&version=${app.gameVersion}&since=${app.lastEventId}`);
+    if (app.view !== 'game' || app.currentRoom?.id !== roomId) return;
+    if (res.ok) {
+      // Delta sync omits game when the version has not changed.
+      ingestRoomEvents(res.events, res.latestEventId);
+      if (res.game) applyGameSnapshot(res);
     }
-  } catch (e) {}
+  })().finally(() => { gameSyncPromise = null; });
+  return gameSyncPromise;
 }
+
+function triggerImmediateGameSync() { return syncGameNow(); }
 
 function startHeartbeatSync() {
   if (app.syncTimer) clearInterval(app.syncTimer);
-
+  let lobbyTicks = 0;
+  let loungeSignature = '';
   app.syncTimer = setInterval(async () => {
-    if (isSyncInProgress) return; // Prevent concurrent sync overlap
+    if (isSyncInProgress || document.visibilityState === 'hidden') return;
     isSyncInProgress = true;
     try {
-      // 1. Lounge Sync
       if (app.view === 'lounge' && app.currentRoom) {
-        const res = await apiGet(`/api/rooms/${app.currentRoom.id}/sync?since=${app.lastEventId}`);
+        const roomId = app.currentRoom.id;
+        const res = await apiGet(`/api/rooms/${roomId}/sync?since=${app.lastEventId}`);
+        if (app.view !== 'lounge' || app.currentRoom?.id !== roomId) return;
         if (res.ok && res.room) {
           app.currentRoom = res.room;
           app.roomPlayers = res.players || [];
-          renderLounge();
-
-          // CRITICAL: If host started the game, other party switches IMMEDIATELY!
-          if (res.room.status === 'playing') {
-            SFX.card();
-            showToast('Host telah memulai permainan! Memasuki meja...', 'success');
-            switchToGameView();
-            return;
-          }
-
-          if (res.latestEventId) app.lastEventId = res.latestEventId;
-          if (res.events && res.events.length > 0) {
-            for (const ev of res.events) {
-              handleServerEvent(ev.event_type, ev.payload);
-            }
-          }
+          const sig = JSON.stringify([res.room.status, app.roomPlayers.map(p =>
+            [p.id, p.seat, p.name, p.avatar, p.frame, p.is_ready, p.is_bot])]);
+          if (sig !== loungeSignature) { renderLounge(); loungeSignature = sig; }
+          ingestRoomEvents(res.events, res.latestEventId);
+          if (res.room.status === 'playing' && app.view === 'lounge') switchToGameView();
         }
+      } else if (app.view === 'game') {
+        await syncGameNow();
+      } else if (app.view === 'lobby' && ++lobbyTicks % 5 === 0) {
+        await refreshRoomsList();
       }
-
-      // 2. Game Sync
-      if (app.view === 'game' && app.currentRoom) {
-        const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
-        if (res.ok && res.game) {
-          // Strictly reject stale state overwrites and prevent DOM rebuild if version hasn't changed
-          const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
-          if (isNewVersion) {
-            app.game = res.game;
-            app.mySeat = res.mySeat;
-            app.gameVersion = res.version || app.gameVersion;
-            renderGameTable();
-          } else if (app.game) {
-            app.game.turnStartedAt = res.game.turnStartedAt;
-            app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
-            updateTurnTimersOnly();
-          }
-
-          if (res.latestEventId) app.lastEventId = res.latestEventId;
-          if (res.events && res.events.length > 0) {
-            for (const ev of res.events) {
-              handleServerEvent(ev.event_type, ev.payload);
-            }
-          }
-        }
-      }
-
-      // 3. Lobby Auto-Refresh
-      if (app.view === 'lobby') {
-        refreshRoomsList();
-      }
-    } catch (e) {
-      console.warn('Sync loop heartbeat error:', e);
-    } finally {
-      isSyncInProgress = false;
-    }
-  }, 1200); // Polls every 1.2s for silky-smooth sync
+    } catch (err) {
+      console.warn('Heartbeat sync failed:', err);
+    } finally { isSyncInProgress = false; }
+  }, 1800);
 }
 
 // ==================== SSE CONNECTION ====================
@@ -579,8 +614,7 @@ function connectRoomSSE(roomId) {
     app.sseSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.id && data.id > app.lastEventId) app.lastEventId = data.id;
-        handleServerEvent(data.type, data.payload);
+        if (data.type !== 'CONNECTED') ingestRoomEvents([data]);
       } catch (e) {}
     };
   } catch (e) {}
@@ -595,10 +629,23 @@ function handleServerEvent(type, payload) {
     SFX.card();
     showToast('Permainan dimulai!', 'success');
     clearChatHistory();
+    app.game = null;
+    app.gameVersion = 0;
+    app.selectedCardIds.clear();
+    resetAiMovePlayback();
     switchToGameView();
   } else if (type === 'GAME_UPDATE') {
-    SFX.card();
-    triggerImmediateGameSync();
+    if (payload?.move) {
+      aiMoveQueue.push(payload.move);
+      if (aiMoveQueue.length > 50) aiMoveQueue.shift();
+      playNextAiMove();
+    }
+    // The authoring client receives the new snapshot from its POST already.
+    // Skip a redundant GET for every AI card; other clients still sync.
+    if (!botStepInFlight && !actionInFlight &&
+        (!payload?.version || Number(payload.version) > Number(app.gameVersion || 0))) {
+      triggerImmediateGameSync();
+    }
   } else if (type === 'ROOM_DELETED') {
     SFX.alert();
     showToast(payload.reason || 'Ruangan telah dihapus', 'warn');
@@ -717,6 +764,11 @@ async function joinRoom(roomIdent, password = '') {
   app.currentRoom = res.room;
   app.mySeat = res.seat;
   app.lastEventId = 0;
+  app.game = null;
+  app.gameVersion = 0;
+  app.selectedCardIds.clear();
+  seenEventIds.clear();
+  resetAiMovePlayback();
   connectRoomSSE(res.room.id);
 
   if (res.reconnected) {
@@ -813,9 +865,8 @@ async function switchToGameView() {
   if (app.currentRoom) {
     const res = await apiGet(`/api/game/${app.currentRoom.id}?playerId=${app.player.id}`);
     if (res.ok && res.game) {
-      app.game = res.game;
-      app.mySeat = res.mySeat;
-      renderGameTable();
+      applyGameSnapshot(res);
+      playNextAiMove();
     }
   }
 }
@@ -1128,24 +1179,26 @@ function renderGameTable() {
 }
 
 async function submitGameAction(action, payload = {}) {
-  if (!app.currentRoom) return;
-  const res = await apiPost(`/api/game/${app.currentRoom.id}/action`, {
-    playerId: app.player.id,
-    action,
-    payload
-  });
-
-  if (!res.ok) {
-    SFX.alert();
-    showToast(res.error || 'Aksi kartu tidak valid!', 'error');
-    return;
+  // Double taps must not submit duplicate moves or overwrite a newer snapshot.
+  if (!app.currentRoom || actionInFlight) return;
+  const roomId = app.currentRoom.id;
+  actionInFlight = true;
+  try {
+    const res = await apiPost(`/api/game/${roomId}/action`, {
+      playerId: app.player.id, action, payload
+    });
+    if (app.currentRoom?.id !== roomId) return;
+    if (!res.ok) {
+      SFX.alert();
+      showToast(res.error || 'Aksi kartu tidak valid!', 'error');
+      if (/berubah|Sinkronkan|giliran habis/i.test(res.error || '')) await triggerImmediateGameSync();
+      return;
+    }
+    app.selectedCardIds.clear();
+    applyGameSnapshot(res);
+  } finally {
+    actionInFlight = false;
   }
-
-  app.selectedCardIds.clear();
-  app.game = res.game;
-  if (res.version) app.gameVersion = res.version;
-  if (res.mySeat !== undefined && res.mySeat !== -1) app.mySeat = res.mySeat;
-  renderGameTable();
 }
 
 async function deleteCurrentRoom() {

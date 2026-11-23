@@ -263,3 +263,23 @@ aside#chat-panel {
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: #0f0d1f; }
 ::-webkit-scrollbar-thumb { background: #4c4478; border: 2px solid #0f0d1f; }
+
+/* Lightweight GPU-friendly card reveal: no full-board repaint required. */
+@keyframes ai-card-enter {
+  from { opacity: 0; transform: translateY(-10px) scale(0.95); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.ai-card-enter {
+  animation: ai-card-enter 220ms ease-out both;
+}
+.ai-move-history {
+  max-height: 42px;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 12px;
+  row-gap: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-card-enter { animation: none; }
+}
