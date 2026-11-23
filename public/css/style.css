@@ -1,0 +1,223 @@
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Silkscreen:wght@400;700&display=swap');
+
+* {
+  box-sizing: border-box;
+  image-rendering: pixelated;
+}
+
+body {
+  font-family: 'Silkscreen', 'Courier New', monospace;
+  background-color: #121024;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+  background-size: 16px 16px;
+  color: #f8fafc;
+  margin: 0;
+  overflow-x: hidden;
+  letter-spacing: 0.01em;
+}
+
+.pixel-font {
+  font-family: 'Press Start 2P', monospace;
+}
+
+/* Global pixel shape overrides */
+.rounded-2xl, .rounded-xl, .rounded-lg, .rounded-full {
+  border-radius: 0px !important;
+}
+
+button {
+  box-shadow: 3px 3px 0px #000000;
+  transition: transform 0.08s steps(2), box-shadow 0.08s steps(2);
+}
+
+button:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0px #000000;
+}
+
+.pixel-box {
+  border: 3px solid #38325c;
+  box-shadow: 4px 4px 0px #070510;
+}
+
+header {
+  border-bottom: 4px solid #000 !important;
+  background: #1b1736 !important;
+}
+
+aside#chat-panel {
+  border-left: 4px solid #000 !important;
+  background: #17132e !important;
+}
+
+/* Pixel Felt Table with checkerboard dither */
+.table-felt {
+  background-color: #166534;
+  background-image: repeating-conic-gradient(#155e2e 0% 25%, #197038 0% 50%);
+  background-size: 16px 16px;
+  box-shadow: inset 0 0 0 4px #0b3b1e, inset 0 0 28px rgba(0, 0, 0, 0.55), 6px 6px 0px #000000;
+  border: 6px solid #713f12;
+  outline: 4px solid #000000;
+}
+
+.table-felt-ring {
+  border: 3px dashed rgba(250, 204, 21, 0.35);
+}
+
+/* 5 Pixel Table Skins */
+.table-emerald .table-felt {
+  background-color: #166534;
+  background-image: repeating-conic-gradient(#155e2e 0% 25%, #197038 0% 50%);
+  border-color: #713f12;
+  box-shadow: inset 0 0 0 4px #0b3b1e, inset 0 0 28px rgba(0, 0, 0, 0.55), 6px 6px 0px #000000;
+}
+
+.table-crimson .table-felt {
+  background-color: #7f1d1d;
+  background-image: repeating-conic-gradient(#7f1d1d 0% 25%, #991b1b 0% 50%);
+  border-color: #b45309;
+  box-shadow: inset 0 0 0 4px #450a0a, inset 0 0 28px rgba(0, 0, 0, 0.55), 6px 6px 0px #000000;
+}
+.table-crimson .table-felt-ring { border-color: rgba(253, 224, 71, 0.45); }
+
+.table-ocean .table-felt {
+  background-color: #1e3a8a;
+  background-image: repeating-conic-gradient(#1e3a8a 0% 25%, #1d4ed8 0% 50%);
+  border-color: #475569;
+  box-shadow: inset 0 0 0 4px #172554, inset 0 0 28px rgba(0, 0, 0, 0.55), 6px 6px 0px #000000;
+}
+.table-ocean .table-felt-ring { border-color: rgba(125, 211, 252, 0.45); }
+
+.table-cyber .table-felt {
+  background-color: #1e1b4b;
+  background-image: repeating-conic-gradient(#1e1b4b 0% 25%, #312e81 0% 50%);
+  border-color: #06b6d4;
+  box-shadow: inset 0 0 0 4px #09071a, inset 0 0 28px rgba(34, 211, 238, 0.28), 6px 6px 0px #000000;
+}
+.table-cyber .table-felt-ring { border-color: rgba(232, 121, 249, 0.55); }
+
+.table-tavern .table-felt {
+  background-color: #78350f;
+  background-image: repeating-linear-gradient(0deg, #78350f 0px, #78350f 14px, #632a0b 14px, #632a0b 16px);
+  background-size: 100% 16px;
+  border-color: #451a03;
+  box-shadow: inset 0 0 0 4px #3b1704, inset 0 0 28px rgba(0, 0, 0, 0.55), 6px 6px 0px #000000;
+}
+.table-tavern .table-felt-ring { border-color: rgba(254, 243, 199, 0.35); }
+
+/* Playing Card Base - Pixel Style */
+.playing-card {
+  position: relative;
+  border-radius: 0px !important;
+  user-select: none;
+  transition: transform 0.1s steps(3), box-shadow 0.1s steps(3);
+  box-shadow: 4px 4px 0px rgba(0, 0, 0, 0.75);
+  flex-shrink: 0;
+}
+
+.playing-card.selectable:hover {
+  transform: translateY(-8px);
+  box-shadow: 4px 10px 0px rgba(0, 0, 0, 0.85);
+}
+
+.playing-card.selected {
+  transform: translateY(-16px) !important;
+  box-shadow: 0 0 0 3px #facc15, 4px 14px 0px #000000 !important;
+}
+
+/* Card Skins - Front Face */
+.skin-royal .card-front {
+  background: #fffbeb;
+  border: 3px solid #1e293b;
+  color: #0f172a;
+}
+.skin-batik .card-front {
+  background: #fef3c7;
+  border: 3px solid #92400e;
+  color: #451a03;
+}
+.skin-cyber .card-front {
+  background: #0f172a;
+  border: 3px solid #22d3ee;
+  color: #e0f2fe;
+}
+.skin-cyber .card-front .suit-red { color: #fb7185 !important; }
+.skin-cyber .card-front .suit-black { color: #38bdf8 !important; }
+
+.skin-sakura .card-front {
+  background: #fff1f2;
+  border: 3px solid #e11d48;
+  color: #4c0519;
+}
+.skin-obsidian .card-front {
+  background: #18181b;
+  border: 3px solid #eab308;
+  color: #fef08a;
+}
+.skin-obsidian .card-front .suit-red { color: #f87171 !important; }
+.skin-obsidian .card-front .suit-black { color: #fde047 !important; }
+
+/* Card Skins - Back Face */
+.skin-royal .card-back {
+  background-color: #1e3a8a;
+  background-image: repeating-conic-gradient(#1d4ed8 0% 25%, #172554 0% 50%);
+  background-size: 8px 8px;
+  border: 3px solid #facc15;
+}
+.skin-batik .card-back {
+  background-color: #78350f;
+  background-image: repeating-conic-gradient(#b45309 0% 25%, #451a03 0% 50%);
+  background-size: 8px 8px;
+  border: 3px solid #fbbf24;
+}
+.skin-cyber .card-back {
+  background-color: #020617;
+  background-image: repeating-conic-gradient(#312e81 0% 25%, #020617 0% 50%);
+  background-size: 8px 8px;
+  border: 3px solid #22d3ee;
+}
+.skin-sakura .card-back {
+  background-color: #be123c;
+  background-image: repeating-conic-gradient(#fb7185 0% 25%, #9f1239 0% 50%);
+  background-size: 8px 8px;
+  border: 3px solid #ffe4e6;
+}
+.skin-obsidian .card-back {
+  background-color: #18181b;
+  background-image: repeating-conic-gradient(#3f3f46 0% 25%, #18181b 0% 50%);
+  background-size: 8px 8px;
+  border: 3px solid #eab308;
+}
+
+.suit-red { color: #dc2626; }
+.suit-black { color: #0f172a; }
+
+/* Emote float animation */
+@keyframes emotePop {
+  0% { opacity: 0; transform: translate(-50%, 8px) scale(0.6); }
+  20% { opacity: 1; transform: translate(-50%, -8px) scale(1.1); }
+  75% { opacity: 1; transform: translate(-50%, -16px) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -28px) scale(0.9); }
+}
+
+.emote-bubble {
+  animation: emotePop 2.4s steps(12) forwards;
+  pointer-events: none;
+}
+
+/* Active turn pixel blink */
+@keyframes turnGlow {
+  0%, 100% { box-shadow: 0 0 0 3px #facc15, 4px 4px 0px #000; }
+  50% { box-shadow: 0 0 0 3px #ffffff, 4px 4px 0px #000; }
+}
+
+.active-turn-seat {
+  animation: turnGlow 0.9s steps(2) infinite;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0f0d1f; }
+::-webkit-scrollbar-thumb { background: #4c4478; border: 2px solid #0f0d1f; }

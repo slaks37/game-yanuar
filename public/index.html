@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Carena 16-Bit — Online PvP Multiplayer Kartu</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body class="min-h-screen flex flex-col skin-royal table-emerald" id="app-body">
+
+  <!-- TOP NAVIGATION BAR -->
+  <header class="sticky top-0 z-30 bg-slate-900/95 backdrop-blur border-b border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
+    <div class="flex items-center gap-2 min-w-0">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-400 to-orange-600 flex items-center justify-center text-slate-950 font-extrabold text-sm shadow">
+        ♠
+      </div>
+      <div class="min-w-0">
+        <div class="flex items-center gap-1.5">
+          <span class="pixel-font text-xs sm:text-sm tracking-tight text-amber-300 truncate">CARENA</span>
+          <span id="header-mode-badge" class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Online PvP</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-1.5">
+      <button id="btn-sound" title="Suara Efek" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition">
+        <span class="text-sm leading-none">🔊</span>
+      </button>
+      <button id="btn-leaderboard" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-yellow-300 text-xs font-semibold flex items-center gap-1.5 border border-yellow-500/25 transition">
+        <span class="text-sm leading-none">🏆</span>
+        <span class="hidden sm:inline">Top Skor</span>
+      </button>
+      <button id="btn-customize" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold flex items-center gap-1.5 border border-amber-500/25 transition">
+        <span class="text-sm leading-none">🎨</span>
+        <span class="hidden sm:inline">Skin & Avatar</span>
+      </button>
+      <button id="btn-unity-bp" class="hidden md:flex px-2.5 py-1.5 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-300 text-xs font-semibold items-center gap-1.5 border border-indigo-500/30 transition">
+        <span class="text-sm leading-none">📐</span>
+        <span>Blueprint</span>
+      </button>
+      <button id="btn-toggle-chat" class="relative px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition">
+        <span class="text-sm leading-none">💬</span>
+        <span class="hidden sm:inline">Chat</span>
+        <span id="chat-unread-badge" class="hidden absolute -top-1 -right-1 w-4 h-4 rounded-full bg-rose-500 text-[10px] font-bold text-white flex items-center justify-center">0</span>
+      </button>
+      <button id="btn-back-lobby" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 text-xs font-semibold flex items-center gap-1 border border-rose-500/30 transition">
+        <span class="text-sm leading-none">🚪</span>
+        <span class="hidden sm:inline">Lobby</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- MAIN CONTAINER -->
+  <div class="flex-1 flex relative overflow-hidden">
+
+    <!-- MAIN VIEW AREA -->
+    <main class="flex-1 overflow-y-auto p-3 sm:p-5 flex flex-col">
+
+      <!-- ==================== LOBBY VIEW ==================== -->
+      <section id="view-lobby" class="max-w-5xl w-full mx-auto space-y-5">
+        
+        <!-- Player Profile Card (Synced with Neon DB) -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pixel-box">
+          <div class="flex items-center gap-3.5">
+            <div id="lobby-avatar-preview" class="w-14 h-14 rounded-2xl flex items-center justify-center text-3xl bg-slate-800 border-2 border-amber-400 shadow-lg shrink-0">
+              🦊
+            </div>
+            <div>
+              <div class="flex items-center gap-2 flex-wrap">
+                <input id="input-player-name" type="text" value="Pemain-1" maxlength="16"
+                  class="bg-slate-800/90 border border-slate-700 focus:border-amber-400 outline-none rounded-lg px-2.5 py-1 text-sm font-bold text-white w-40" />
+                <button id="btn-save-name" class="px-2 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold rounded">Simpan</button>
+                <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                  <span id="lobby-chips-count">2.500</span> Koin
+                </span>
+                <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  <span id="lobby-wins-count">0</span> Menang / <span id="lobby-matches-count">0</span> Main
+                </span>
+              </div>
+              <p class="text-xs text-slate-400 mt-1.5">
+                Kartu: <span id="lobby-skin-label" class="text-amber-300 font-semibold">Klasik Royal</span> · Meja: <span id="lobby-table-label" class="text-emerald-300 font-semibold">Zamrud Klasik</span> · Server: <span class="text-emerald-400 font-semibold">game.newsystem.space</span>
+              </p>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button id="btn-quick-create-room" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs border-2 border-black flex items-center gap-1.5 shadow">
+              <span>➕</span> Buat Ruangan
+            </button>
+          </div>
+        </div>
+
+        <!-- ==================== REAL-TIME MULTIPLAYER ROOMS ==================== -->
+        <div class="bg-slate-900/95 pixel-box p-4 space-y-3.5">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b-2 border-slate-800 pb-3">
+            <div>
+              <h2 class="pixel-font text-xs sm:text-sm text-amber-300 flex items-center gap-2">
+                <span>🏠</span> RUANGAN ONLINE PVP (NEON DATABASE)
+              </h2>
+              <p class="text-[11px] text-slate-400 mt-1">Gabung ke ruangan mabar aktif, atau buat ruangan baru untuk bertanding real-time.</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <div class="flex items-center gap-1">
+                <input id="input-join-code" type="text" placeholder="Kode #KRT-..." maxlength="10"
+                  class="bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-2.5 py-1.5 text-xs text-amber-200 w-32 uppercase" />
+                <button id="btn-join-by-code" class="px-2.5 py-1.5 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs border-2 border-black">
+                  Gabung
+                </button>
+              </div>
+              <button id="btn-refresh-rooms" title="Refresh Daftar Ruangan" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-black">
+                🔄
+              </button>
+            </div>
+          </div>
+
+          <!-- Live Rooms Grid -->
+          <div id="rooms-list" class="grid grid-cols-1 md:grid-cols-2 gap-3 min-h-[120px]">
+            <div class="col-span-full py-8 text-center text-slate-400 text-xs">
+              Memuat ruangan aktif dari server...
+            </div>
+          </div>
+        </div>
+
+        <!-- 8 Game Modes Showcase -->
+        <div>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm sm:text-base font-bold text-white flex items-center gap-2">
+              <span class="text-amber-400">♠</span>
+              Pilih Mode Kartu (8 Mode PvP)
+            </h2>
+            <span class="text-xs text-slate-400">Pilih mode untuk buat ruangan instan</span>
+          </div>
+          <div id="modes-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== ROOM LOUNGE (WAITING ROOM) ==================== -->
+      <section id="view-lounge" class="hidden max-w-4xl w-full mx-auto space-y-4">
+        <div class="bg-slate-900/95 pixel-box p-5 space-y-5">
+          <!-- Room Header -->
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b-2 border-slate-800 pb-3">
+            <div>
+              <div class="flex items-center gap-2">
+                <span id="lounge-mode-icon" class="text-2xl">👑</span>
+                <div>
+                  <h2 id="lounge-room-name" class="pixel-font text-sm text-amber-300">Ruangan Mabar</h2>
+                  <div class="text-xs text-slate-400 mt-0.5">
+                    Mode: <strong id="lounge-mode-title" class="text-emerald-300">Capsa Banting</strong> · Host: <span id="lounge-host-name" class="text-amber-300 font-bold">Raka</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <span id="lounge-code-badge" class="px-3 py-1 bg-slate-950 border-2 border-amber-400 text-amber-300 pixel-font text-xs">#KRT-0000</span>
+              <button id="btn-copy-invite-link" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs border-2 border-black flex items-center gap-1">
+                <span>📋</span> Salin Link
+              </button>
+            </div>
+          </div>
+
+          <!-- Seats Grid -->
+          <div>
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-bold text-slate-300">Pemain di Kursi Meja (<span id="lounge-seated-count">1</span>/<span id="lounge-max-count">4</span>):</span>
+              <span class="text-[11px] text-amber-300">Semua pemain bisa chat & berikan emote di kanan 💬</span>
+            </div>
+            <div id="lounge-seats-grid" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <!-- Rendered by JS -->
+            </div>
+          </div>
+
+          <!-- Lounge Action Buttons -->
+          <div class="flex flex-wrap items-center justify-between gap-2 pt-3 border-t-2 border-slate-800">
+            <button id="btn-lounge-leave" class="px-4 py-2 bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 font-bold text-xs border-2 border-rose-500/40">
+              🚪 Keluar Ruangan
+            </button>
+            
+            <div class="flex items-center gap-2">
+              <button id="btn-lounge-fill-bots" class="hidden px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-slate-600">
+                🤖 Isi Sisa dengan Bot
+              </button>
+              <button id="btn-lounge-ready" class="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs border-2 border-black">
+                ✅ Saya Siap!
+              </button>
+              <button id="btn-lounge-start" class="hidden px-5 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 pixel-font text-xs border-2 border-black">
+                ▶ MULAI MAIN
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== GAME TABLE VIEW ==================== -->
+      <section id="view-game" class="hidden flex-1 flex flex-col max-w-6xl w-full mx-auto gap-3">
+        <!-- Mode Info & Status Banner -->
+        <div class="bg-slate-900/90 border border-slate-800 rounded-xl px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 pixel-box">
+          <div class="flex items-center gap-2 min-w-0">
+            <span id="game-mode-icon" class="text-lg">🃏</span>
+            <div class="min-w-0">
+              <div class="text-xs sm:text-sm font-bold text-white truncate" id="game-mode-title">Mode Permainan</div>
+              <div class="text-[11px] text-slate-400 truncate" id="game-status-text">Menyiapkan meja...</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="btn-mode-rules" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 transition">
+              <span>❓</span> Aturan
+            </button>
+            <button id="btn-restart-round" class="px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 text-xs font-semibold flex items-center gap-1 border border-emerald-500/30 transition">
+              <span>🔄</span> Ronde Baru
+            </button>
+          </div>
+        </div>
+
+        <!-- PIXEL TABLE ARENA -->
+        <div class="relative flex-1 min-h-[340px] sm:min-h-[410px] table-felt p-3 sm:p-5 flex flex-col justify-between overflow-hidden">
+          <div class="pointer-events-none absolute inset-3 sm:inset-5 table-felt-ring"></div>
+
+          <!-- Opponents Row -->
+          <div id="opponents-container" class="relative z-10 flex flex-wrap items-start justify-center gap-2 sm:gap-3 pt-1">
+            <!-- Rendered by JS -->
+          </div>
+
+          <!-- Center Table Board -->
+          <div id="table-center" class="relative z-10 my-auto py-2 flex flex-col items-center justify-center text-center gap-2">
+            <!-- Mode-specific center content -->
+          </div>
+
+          <!-- Bottom Player Info Strip inside table -->
+          <div class="relative z-10 flex items-center justify-between gap-2 pt-1">
+            <div id="my-seat-badge" class="relative flex items-center gap-2 bg-slate-950/85 border-2 border-slate-700 px-2.5 py-1.5">
+              <span id="my-seat-avatar" class="text-xl">🦊</span>
+              <div class="leading-tight">
+                <div class="text-xs font-bold text-white flex items-center gap-1.5">
+                  <span id="my-seat-name">Kamu</span>
+                  <span id="my-turn-pill" class="hidden px-1.5 py-0.5 bg-amber-400 text-slate-950 text-[10px] font-extrabold">GILIRANMU</span>
+                </div>
+                <div class="text-[11px] text-amber-300 font-medium" id="my-seat-sub">0 Kartu</div>
+              </div>
+              <div id="my-emote-anchor" class="absolute -top-6 left-1/2"></div>
+            </div>
+
+            <!-- Action Buttons Bar -->
+            <div id="action-bar" class="flex flex-wrap items-center justify-end gap-1.5">
+              <!-- Populated by JS -->
+            </div>
+          </div>
+        </div>
+
+        <!-- PLAYER HAND + EMOTE BAR -->
+        <div class="bg-slate-900/95 pixel-box p-3 space-y-2.5">
+          <div id="player-hand" class="flex items-end justify-start sm:justify-center gap-1.5 overflow-x-auto pb-1 pt-4 min-h-[112px]">
+            <!-- Cards rendered by JS -->
+          </div>
+          <div class="flex items-center justify-between gap-2 border-t-2 border-slate-800 pt-2">
+            <span class="text-[11px] font-semibold text-slate-400 shrink-0">Emote Cepat:</span>
+            <div id="emote-bar" class="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+              <!-- Emote buttons rendered by JS -->
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- RIGHT CHAT DRAWER / SIDEBAR -->
+    <aside id="chat-panel" class="hidden fixed sm:static inset-y-0 right-0 z-40 w-80 max-w-[90vw] bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl sm:shadow-none">
+      <div class="p-3 border-b-2 border-slate-800 flex items-center justify-between">
+        <div class="flex items-center gap-2 min-w-0">
+          <span>💬</span>
+          <span id="chat-room-title" class="text-xs font-bold text-amber-300 truncate">Chat Ruangan</span>
+        </div>
+        <button id="btn-close-chat" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">
+          <span class="text-xs font-bold leading-none">✕</span>
+        </button>
+      </div>
+
+      <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2.5 text-xs"></div>
+
+      <div class="px-3 py-2 border-t-2 border-slate-800/80 flex flex-wrap gap-1">
+        <button class="quick-chat-btn px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700">Ayo cepet! ⏱️</button>
+        <button class="quick-chat-btn px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700">Wah bohong nih! 🤨</button>
+        <button class="quick-chat-btn px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700">Kartu bagus! 🔥</button>
+        <button class="quick-chat-btn px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700">Mantap GG! 👏</button>
+      </div>
+
+      <form id="chat-form" class="p-2.5 border-t-2 border-slate-800 flex items-center gap-1.5">
+        <input id="chat-input" type="text" placeholder="Ketik pesan..." maxlength="120"
+          class="flex-1 bg-slate-950 border-2 border-slate-700 focus:border-emerald-400 outline-none px-3 py-1.5 text-xs text-white" />
+        <button type="submit" class="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs border-2 border-black">
+          Kirim
+        </button>
+      </form>
+    </aside>
+  </div>
+
+  <!-- ==================== MODAL: BUAT RUANGAN ==================== -->
+  <div id="modal-create-room" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-md w-full p-5 space-y-4">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 class="pixel-font text-xs text-amber-300 flex items-center gap-2">
+          <span>➕</span> BUAT RUANGAN BARU
+        </h3>
+        <button data-close-modal="modal-create-room" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+
+      <form id="form-create-room" class="space-y-3.5 text-xs">
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Nama Ruangan</label>
+          <input id="cr-name" type="text" value="Ruang Mabar Seru" maxlength="32" required
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-white font-bold" />
+        </div>
+
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Mode Kartu</label>
+          <select id="cr-mode" class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-amber-300 font-bold">
+            <!-- Populated by JS -->
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Jumlah Maksimal Kursi</label>
+          <select id="cr-max" class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-white">
+            <option value="4" selected>4 Pemain</option>
+            <option value="5">5 Pemain</option>
+            <option value="6">6 Pemain</option>
+            <option value="7">7 Pemain</option>
+            <option value="8">8 Pemain</option>
+          </select>
+        </div>
+
+        <div class="space-y-2 pt-1 border-t border-slate-800">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="cr-use-pass" type="checkbox" class="w-4 h-4 accent-amber-400 cursor-pointer" />
+            <span class="font-bold text-amber-300">Kunci Ruangan dengan Password (Private)</span>
+          </label>
+          <div id="cr-pass-wrap" class="hidden">
+            <input id="cr-password" type="text" placeholder="Masukkan password ruangan..." maxlength="20"
+              class="w-full bg-slate-950 border-2 border-amber-400/60 focus:border-amber-400 outline-none px-3 py-1.5 text-white" />
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-2 border-t-2 border-slate-800">
+          <button type="button" data-close-modal="modal-create-room" class="px-3 py-1.5 bg-slate-800 text-slate-300 font-bold">Batal</button>
+          <button type="submit" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold border-2 border-black">
+            Buat Ruangan
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: GABUNG PASSWORD ==================== -->
+  <div id="modal-join-password" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-sm w-full p-5 space-y-4">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 class="pixel-font text-xs text-amber-300">🔒 RUANGAN BERPASSWORD</h3>
+        <button data-close-modal="modal-join-password" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+      <p class="text-xs text-slate-300">Ruangan ini dilindungi kata sandi. Masukkan password untuk bergabung:</p>
+      <form id="form-join-password" class="space-y-3">
+        <input id="jp-input" type="password" placeholder="Password ruangan..." maxlength="30" required
+          class="w-full bg-slate-950 border-2 border-amber-400 outline-none px-3 py-2 text-xs text-white" />
+        <div id="jp-error" class="hidden text-rose-400 text-xs font-bold">Password salah! Coba lagi.</div>
+        <div class="flex justify-end gap-2">
+          <button type="button" data-close-modal="modal-join-password" class="px-3 py-1.5 bg-slate-800 text-slate-300 text-xs font-bold">Batal</button>
+          <button type="submit" class="px-4 py-1.5 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs border-2 border-black">Masuk</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: LEADERBOARD ==================== -->
+  <div id="modal-leaderboard" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-lg w-full max-h-[85vh] overflow-y-auto p-5 space-y-4">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 class="pixel-font text-xs text-yellow-300 flex items-center gap-2">
+          <span>🏆</span> PAPAN PERINGKAT SERVER (NEON DB)
+        </h3>
+        <button data-close-modal="modal-leaderboard" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+
+      <div id="leaderboard-list" class="space-y-2 text-xs">
+        <!-- Rendered by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: SKIN & AVATAR ==================== -->
+  <div id="modal-customize" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-xl w-full max-h-[88vh] overflow-y-auto p-5 space-y-5">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 class="pixel-font text-xs text-amber-300 flex items-center gap-2">
+          <span>✨</span> SKIN KARTU & AVATAR
+        </h3>
+        <button data-close-modal="modal-customize" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+
+      <div>
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">Pilih Skin Kartu</div>
+        <div id="skins-grid" class="grid grid-cols-2 sm:grid-cols-3 gap-2.5"></div>
+      </div>
+
+      <div>
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">Pilih Skin Meja</div>
+        <div id="table-skins-grid" class="grid grid-cols-2 sm:grid-cols-3 gap-2.5"></div>
+      </div>
+
+      <div>
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">Pilih Avatar Pemain</div>
+        <div id="avatars-grid" class="grid grid-cols-5 gap-2"></div>
+      </div>
+
+      <div>
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">Bingkai Avatar</div>
+        <div id="frames-grid" class="flex flex-wrap gap-2"></div>
+      </div>
+
+      <div class="flex justify-end pt-2 border-t-2 border-slate-800">
+        <button id="btn-save-cosmetics" class="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">
+          Simpan ke Database
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: GAME RULES ==================== -->
+  <div id="modal-rules" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-lg w-full p-5 space-y-3.5">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 id="rules-modal-title" class="pixel-font text-xs text-amber-300">ATURAN PERMAINAN</h3>
+        <button data-close-modal="modal-rules" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+      <p id="rules-modal-body" class="text-xs text-slate-200 leading-relaxed whitespace-pre-line"></p>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: BLUEPRINT UNITY ==================== -->
+  <div id="modal-unity" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-2xl w-full max-h-[88vh] overflow-y-auto p-5 space-y-4">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <h3 class="pixel-font text-xs text-indigo-300 flex items-center gap-2">
+          <span>📐</span> BLUEPRINT UNITY & VERCEL
+        </h3>
+        <button data-close-modal="modal-unity" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+        <div class="bg-slate-800/80 border-2 border-slate-700 p-3 space-y-1.5">
+          <div class="font-bold text-indigo-300">1. Client Unity (C# + URP 2D Pixel)</div>
+          <p class="text-slate-300 leading-relaxed">Codebase Unity untuk export <strong>.APK/.AAB</strong> (Android) dan <strong>.IPA</strong> (iOS). Connect via WebSocket atau REST SSE ke <code>game.newsystem.space</code>.</p>
+        </div>
+        <div class="bg-slate-800/80 border-2 border-slate-700 p-3 space-y-1.5">
+          <div class="font-bold text-emerald-300">2. Backend Vercel + Neon DB</div>
+          <p class="text-slate-300 leading-relaxed">Serverless Engine terhubung ke Neon PostgreSQL di region Singapore (ap-southeast-1) dengan Server-Sent Events real-time synchronization.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST NOTIFICATION CONTAINER -->
+  <div id="toast-container" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- CLIENT JAVASCRIPT -->
+  <script src="/js/app.js"></script>
+</body>
+</html>
