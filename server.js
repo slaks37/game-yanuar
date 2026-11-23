@@ -50,15 +50,40 @@ async function recordRoomEvent(roomId, eventType, payload) {
 // Execute bot turn on authoritative state in Neon DB
 async function runBotTurnsIfNeeded(roomId, g) {
   let steps = 0;
-  while (!g.finished && steps < 8) {
+  while (!g.finished && steps < 16) {
     const currentPl = g.players[g.turn];
-    if (!currentPl || !currentPl.isBot) break;
+    if (!currentPl) break;
+    const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
+    if (!isBot) break;
+
+    // Ensure player is marked as bot
+    currentPl.isBot = true;
 
     const decision = getBotDecision(g, g.turn);
-    if (!decision) break;
+    if (!decision) {
+      console.warn(`[Bot Warning] No decision for bot ${currentPl.name} in mode ${g.mode}. Advancing turn.`);
+      g.turn = (g.turn + 1) % g.players.length;
+      steps++;
+      continue;
+    }
 
     const res = processGameAction(g, g.turn, decision.action, decision.payload);
-    if (!res.ok) break;
+    if (!res.ok) {
+      console.error(`[Bot Error] Action failed for bot ${currentPl.name}: ${res.error}. Forcing fallback.`);
+      if (g.mode === 'capsa') {
+        if (g.mustInclude3D) {
+          const c3d = currentPl.hand.find(c => c.rank === '3' && c.suit === '♦');
+          if (c3d) processGameAction(g, g.turn, 'play', { cardIds: [c3d.id] });
+          else g.turn = (g.turn + 1) % g.players.length;
+        } else {
+          processGameAction(g, g.turn, 'pass', {});
+        }
+      } else {
+        g.turn = (g.turn + 1) % g.players.length;
+      }
+      steps++;
+      continue;
+    }
 
     steps++;
   }
@@ -679,7 +704,7 @@ app.post('/api/rooms/:id/start', async (req, res) => {
     if (room.host_id !== hostId) return res.status(403).json({ error: 'Hanya host yang bisa memulai permainan!' });
 
     const playersRes = await query(`
-      SELECT rp.seat, rp.is_bot, rp.bot_profile,
+      SELECT rp.seat, rp.is_bot, rp.is_bot as "isBot", rp.bot_profile,
              COALESCE(p.id, rp.player_id) as id,
              COALESCE(p.name, rp.bot_profile->>'name') as name,
              COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar,
