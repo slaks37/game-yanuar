@@ -47,26 +47,30 @@ async function recordRoomEvent(roomId, eventType, payload) {
   }
 }
 
-// Execute bot turn on authoritative state in Neon DB
-async function runBotTurnsIfNeeded(roomId, g) {
-  let steps = 0;
-  while (!g.finished && steps < 16) {
-    const currentPl = g.players[g.turn];
-    if (!currentPl) break;
-    const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
-    if (!isBot) break;
+// Execute 1 bot turn step on authoritative state in Neon DB
+// Paced execution allows human players to visually see every CPU move step-by-step
+async function runBotTurnsIfNeeded(roomId, g, force = false) {
+  if (!g || g.finished) return g;
 
-    // Ensure player is marked as bot
-    currentPl.isBot = true;
+  const currentPl = g.players[g.turn];
+  if (!currentPl) return g;
+  const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
+  if (!isBot) return g;
 
-    const decision = getBotDecision(g, g.turn);
-    if (!decision) {
-      console.warn(`[Bot Warning] No decision for bot ${currentPl.name} in mode ${g.mode}. Advancing turn.`);
-      g.turn = (g.turn + 1) % g.players.length;
-      steps++;
-      continue;
-    }
+  // Realistic pacing: ensure at least 700ms has elapsed so players can observe the previous move
+  const elapsedMs = Date.now() - (g.turnStartedAt || 0);
+  if (!force && elapsedMs < 700) {
+    return g;
+  }
 
+  currentPl.isBot = true;
+
+  const decision = getBotDecision(g, g.turn);
+  if (!decision) {
+    console.warn(`[Bot Warning] No decision for bot ${currentPl.name} in mode ${g.mode}. Advancing turn.`);
+    g.turn = (g.turn + 1) % g.players.length;
+    g.turnStartedAt = Date.now();
+  } else {
     const res = processGameAction(g, g.turn, decision.action, decision.payload);
     if (!res.ok) {
       console.error(`[Bot Error] Action failed for bot ${currentPl.name}: ${res.error}. Forcing fallback.`);
@@ -81,32 +85,36 @@ async function runBotTurnsIfNeeded(roomId, g) {
       } else {
         g.turn = (g.turn + 1) % g.players.length;
       }
-      steps++;
-      continue;
-    }
-
-    steps++;
-  }
-
-  if (steps > 0) {
-    // Save updated state to DB
-    await query(
-      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-      [JSON.stringify(g), roomId]
-    );
-
-    await recordRoomEvent(roomId, 'GAME_UPDATE', {
-      status: g.status,
-      turn: g.turn,
-      finished: g.finished,
-      winnerText: g.winnerText,
-      mode: g.mode
-    });
-
-    if (g.finished) {
-      await handleGameOver(roomId, g);
+      g.turnStartedAt = Date.now();
+    } else {
+      // In Empatsatu (41), bot needs to draw AND discard in the same turn
+      if (g.mode === 'empatsatu' && g.phase === 'discard') {
+        const discardDec = getBotDecision(g, g.turn);
+        if (discardDec) {
+          processGameAction(g, g.turn, discardDec.action, discardDec.payload);
+        }
+      }
     }
   }
+
+  // Save updated state to DB and increment version
+  await query(
+    'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
+    [JSON.stringify(g), roomId]
+  );
+
+  await recordRoomEvent(roomId, 'GAME_UPDATE', {
+    status: g.status,
+    turn: g.turn,
+    finished: g.finished,
+    winnerText: g.winnerText,
+    mode: g.mode
+  });
+
+  if (g.finished) {
+    await handleGameOver(roomId, g);
+  }
+
   return g;
 }
 
@@ -295,21 +303,46 @@ app.post('/api/player/rename', async (req, res) => {
     }
 
     const cleanName = name.trim().slice(0, 24);
+    // Upsert into players table guaranteed
     const update = await query(
-      `UPDATE players
-       SET name = $2, last_active_at = NOW()
-       WHERE id = $1
+      `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
+       VALUES ($1, $2, '🦊', 'border-amber-400', 'skin-royal', 'table-emerald', 2500, 2500, 0, 0, NOW())
+       ON CONFLICT (id) DO UPDATE SET name = $2, last_active_at = NOW()
        RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
       [id, cleanName]
     );
 
-    if (update.rows.length === 0) {
-      return res.status(404).json({ error: 'Player tidak ditemukan' });
-    }
-
     const updatedPlayer = update.rows[0];
 
-    // Find any room player is in and broadcast
+    // Update any active game state where this player is seated
+    const activeGames = await query(
+      `SELECT gs.room_id, gs.state, gs.version
+       FROM game_states gs
+       JOIN room_players rp ON gs.room_id = rp.room_id
+       WHERE rp.player_id = $1`,
+      [id]
+    );
+
+    for (const gRow of activeGames.rows) {
+      const gState = gRow.state;
+      let stateChanged = false;
+      if (gState && gState.players) {
+        for (const pl of gState.players) {
+          if (pl.playerId === id) {
+            pl.name = cleanName;
+            stateChanged = true;
+          }
+        }
+      }
+      if (stateChanged) {
+        await query(
+          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
+          [JSON.stringify(gState), gRow.room_id]
+        );
+      }
+    }
+
+    // Broadcast to any room player is in
     const roomsSeated = await query('SELECT DISTINCT room_id, seat FROM room_players WHERE player_id = $1', [id]);
     for (const r of roomsSeated.rows) {
       await recordRoomEvent(r.room_id, 'PLAYER_NAME_CHANGED', { playerId: id, name: cleanName, seat: r.seat });
@@ -325,7 +358,7 @@ app.post('/api/player/rename', async (req, res) => {
 app.post('/api/player/sync', async (req, res) => {
   try {
     const { id, name, avatar, frame, skin, tableSkin } = req.body;
-    if (!id || !name) return res.status(400).json({ error: 'Missing id or name' });
+    if (!id) return res.status(400).json({ error: 'Missing id' });
 
     const existing = await query('SELECT * FROM players WHERE id = $1', [id]);
     if (existing.rows.length === 0) {
@@ -333,10 +366,13 @@ app.post('/api/player/sync', async (req, res) => {
         `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
          VALUES ($1, $2, $3, $4, $5, $6, 2500, 2500, 0, 0, NOW())
          RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
-        [id, name, avatar || '🦊', frame || 'border-amber-400', skin || 'skin-royal', tableSkin || 'table-emerald']
+        [id, name || 'Pemain', avatar || '🦊', frame || 'border-amber-400', skin || 'skin-royal', tableSkin || 'table-emerald']
       );
       return res.json({ ok: true, player: insert.rows[0] });
     }
+
+    // Preserve saved name in database so it is never overwritten by default guest name
+    const authoritativeName = existing.rows[0].name || name;
 
     const update = await query(
       `UPDATE players
@@ -349,7 +385,7 @@ app.post('/api/player/sync', async (req, res) => {
            last_active_at = NOW()
        WHERE id = $1
        RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
-      [id, name, avatar || existing.rows[0].avatar, frame || existing.rows[0].frame, skin || existing.rows[0].skin, tableSkin || existing.rows[0].table_skin]
+      [id, authoritativeName, avatar || existing.rows[0].avatar, frame || existing.rows[0].frame, skin || existing.rows[0].skin, tableSkin || existing.rows[0].table_skin]
     );
     res.json({ ok: true, player: update.rows[0] });
   } catch (err) {
@@ -383,10 +419,10 @@ app.get('/api/rooms', async (req, res) => {
 
     const rooms = await query(`
       SELECT r.id, r.code, r.name, r.mode, r.max_players, r.is_private, r.status, r.created_at, r.updated_at,
-             p.name as host_name, p.avatar as host_avatar,
+             COALESCE(p.name, 'Host') as host_name, COALESCE(p.avatar, '🦊') as host_avatar,
              COUNT(rp.player_id) as current_players
       FROM rooms r
-      JOIN players p ON r.host_id = p.id
+      LEFT JOIN players p ON r.host_id = p.id
       LEFT JOIN room_players rp ON r.id = rp.room_id
       GROUP BY r.id, p.name, p.avatar
       ORDER BY r.created_at DESC
@@ -732,9 +768,6 @@ app.post('/api/rooms/:id/start', async (req, res) => {
 
     await recordRoomEvent(roomId, 'GAME_START', { mode: room.mode });
 
-    // Check if starter is bot
-    await runBotTurnsIfNeeded(roomId, gameState);
-
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -855,15 +888,44 @@ app.post('/api/game/:roomId/action', async (req, res) => {
 
     if (g.finished) {
       await handleGameOver(roomId, g);
-    } else {
-      // Execute bot turns if next is bot
-      await runBotTurnsIfNeeded(roomId, g);
     }
 
     const updatedRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
     const finalVersion = updatedRow.rows.length > 0 ? updatedRow.rows[0].version : dbG.rows[0].version + 1;
 
     res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx), mySeat: pIdx, version: finalVersion });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 13b. Explicit Bot Step API (for paced step-by-step bot turns)
+app.post('/api/game/:roomId/bot-step', async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const playerId = req.body.playerId;
+
+    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+    let g = dbG.rows[0].state;
+    g = await checkAndApplyTurnTimeout(roomId, g);
+    g = await runBotTurnsIfNeeded(roomId, g);
+
+    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
+    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
+
+    let pIdx = -1;
+    if (playerId) {
+      pIdx = g.players.findIndex(p => p.playerId === playerId);
+    }
+
+    res.json({
+      ok: true,
+      game: sanitizeGameStateForPlayer(g, pIdx),
+      mySeat: pIdx,
+      version: latestVersion
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -309,14 +309,32 @@ async function renamePlayer(newName) {
     showToast('Nama tidak boleh kosong!', 'warn');
     return;
   }
+  const clean = newName.trim().slice(0, 24);
+  app.player.name = clean;
+  localStorage.setItem('carena_player_name', clean);
+  const nameInput = document.getElementById('input-player-name');
+  if (nameInput) nameInput.value = clean;
+
+  updatePlayerUI();
+  if (app.game && app.game.players) {
+    const pl = app.game.players.find(x => x.playerId === app.player.id);
+    if (pl) pl.name = clean;
+    renderGameTable();
+  }
+  if (app.roomPlayers) {
+    const pl = app.roomPlayers.find(x => x.id === app.player.id);
+    if (pl) pl.name = clean;
+    renderLounge();
+  }
+
   const res = await apiPost('/api/player/rename', {
     id: app.player.id,
-    name: newName.trim()
+    name: clean
   });
 
   if (res.ok && res.player) {
     applyPlayerProfile(res.player);
-    showToast(`Nama berhasil diubah menjadi "${res.player.name}"!`, 'success');
+    showToast(`Nama berhasil disimpan: "${res.player.name}"!`, 'success');
   } else {
     showToast(res.error || 'Gagal mengubah nama', 'error');
   }
@@ -387,19 +405,97 @@ function applyCosmetics() {
 
 // ==================== HEARTBEAT SYNC LOOP (100% RELIABLE PVP) ====================
 let isSyncInProgress = false;
+let botStepTimer = null;
+
+function scheduleBotStepIfNeeded() {
+  if (app.view !== 'game' || !app.currentRoom || !app.game || app.game.finished) {
+    if (botStepTimer) { clearTimeout(botStepTimer); botStepTimer = null; }
+    return;
+  }
+
+  const currentPl = app.game.players ? app.game.players[app.game.turn] : null;
+  if (!currentPl) return;
+
+  const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
+  if (isBot) {
+    if (botStepTimer) clearTimeout(botStepTimer);
+    botStepTimer = setTimeout(async () => {
+      botStepTimer = null;
+      if (app.view !== 'game' || !app.currentRoom) return;
+      try {
+        const res = await apiPost(`/api/game/${app.currentRoom.id}/bot-step`, {
+          playerId: app.player.id
+        });
+        if (res.ok && res.game) {
+          const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
+          if (isNewVersion) {
+            app.game = res.game;
+            app.gameVersion = res.version || app.gameVersion;
+            if (res.mySeat !== undefined && res.mySeat !== -1) {
+              app.mySeat = res.mySeat;
+            }
+            SFX.card();
+            renderGameTable();
+          }
+        }
+      } catch (err) {
+        console.warn('Bot step error:', err);
+      }
+    }, 850);
+  } else {
+    if (botStepTimer) { clearTimeout(botStepTimer); botStepTimer = null; }
+  }
+}
+
+function updateTurnTimersOnly() {
+  const g = app.game;
+  if (!g || g.finished) return;
+  const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
+  const remainingSec = Math.max(0, (g.turnTimeLimitSec || 60) - elapsedSec);
+
+  const timerBadgeEl = document.getElementById('game-turn-timer-text');
+  if (timerBadgeEl) {
+    timerBadgeEl.textContent = `${remainingSec}s`;
+    const parent = timerBadgeEl.parentElement;
+    if (parent) {
+      parent.classList.toggle('border-rose-500', remainingSec <= 10);
+      parent.classList.toggle('text-rose-400', remainingSec <= 10);
+      parent.classList.toggle('border-amber-400', remainingSec > 10);
+      parent.classList.toggle('text-amber-300', remainingSec > 10);
+    }
+  }
+
+  const myTurnTimer = document.getElementById('my-turn-timer');
+  if (myTurnTimer && !myTurnTimer.classList.contains('hidden')) {
+    myTurnTimer.textContent = `⏱️ ${remainingSec}s`;
+    myTurnTimer.className = remainingSec <= 10
+      ? 'px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse'
+      : 'px-1.5 py-0.5 bg-amber-500 text-slate-950 text-[10px] font-mono font-extrabold';
+  }
+
+  const activeOppBadge = document.querySelector('.active-turn-seat [data-turn-timer]');
+  if (activeOppBadge) {
+    activeOppBadge.textContent = `⏱️ ${remainingSec}s`;
+  }
+}
 
 async function triggerImmediateGameSync() {
   if (app.view !== 'game' || !app.currentRoom) return;
   try {
     const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
     if (res.ok && res.game) {
-      if (!res.version || res.version >= app.gameVersion) {
+      const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
+      if (isNewVersion) {
         app.game = res.game;
         app.gameVersion = res.version || app.gameVersion;
         if (res.mySeat !== undefined && res.mySeat !== -1) {
           app.mySeat = res.mySeat;
         }
         renderGameTable();
+      } else if (app.game) {
+        app.game.turnStartedAt = res.game.turnStartedAt;
+        app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
+        updateTurnTimersOnly();
       }
     }
   } catch (e) {}
@@ -441,12 +537,17 @@ function startHeartbeatSync() {
       if (app.view === 'game' && app.currentRoom) {
         const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
         if (res.ok && res.game) {
-          // Strictly reject stale state overwrites
-          if (!res.version || res.version >= app.gameVersion) {
+          // Strictly reject stale state overwrites and prevent DOM rebuild if version hasn't changed
+          const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
+          if (isNewVersion) {
             app.game = res.game;
             app.mySeat = res.mySeat;
             app.gameVersion = res.version || app.gameVersion;
             renderGameTable();
+          } else if (app.game) {
+            app.game.turnStartedAt = res.game.turnStartedAt;
+            app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
+            updateTurnTimersOnly();
           }
 
           if (res.latestEventId) app.lastEventId = res.latestEventId;
@@ -590,6 +691,10 @@ async function refreshRoomsList() {
 }
 
 async function joinRoom(roomIdent, password = '') {
+  const nameInput = document.getElementById('input-player-name');
+  if (nameInput && nameInput.value.trim() && nameInput.value.trim() !== app.player.name) {
+    await renamePlayer(nameInput.value.trim());
+  }
   showToast('Menghubungkan ke ruangan...', 'info');
   const res = await apiPost(`/api/rooms/${roomIdent}/join`, {
     playerId: app.player.id,
@@ -752,7 +857,7 @@ function renderGameTable() {
 
     const isGoFishTarget = g.mode === 'gofish' && g.targetPlayerIdx === p.id;
     const clickCls = g.mode === 'gofish' ? 'cursor-pointer hover:border-amber-400' : '';
-    const turnBadge = isTurn ? `<span class="px-1 py-0.5 bg-amber-400 text-slate-950 text-[9px] font-mono font-extrabold ml-1">⏱️ ${remainingSec}s</span>` : '';
+    const turnBadge = isTurn ? `<span data-turn-timer class="px-1 py-0.5 bg-amber-400 text-slate-950 text-[9px] font-mono font-extrabold ml-1">⏱️ ${remainingSec}s</span>` : '';
     return `
       <div data-opp-seat="${p.id}" class="relative bg-slate-950/85 border-2 ${isGoFishTarget ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-slate-700'} ${isTurn ? 'active-turn-seat ring-2 ring-amber-400' : ''} ${clickCls} px-2.5 py-1.5 flex items-center gap-2 min-w-[112px] transition">
         <div class="w-8 h-8 bg-slate-800 border-2 ${p.frame || 'border-amber-400'} flex items-center justify-center text-base shrink-0">${p.avatar}</div>
@@ -997,6 +1102,18 @@ function renderGameTable() {
       });
     });
   }
+
+  // 5. Visual action cue & speech bubble for opponent/bot moves
+  if (g.lastAction && g.lastAction.by !== myIdx && g.lastAction.text) {
+    const actionKey = `${app.gameVersion}_${g.lastAction.by}_${g.lastAction.text}`;
+    if (app.lastSeenActionKey !== actionKey) {
+      app.lastSeenActionKey = actionKey;
+      triggerSpeechBubble(g.lastAction.by, g.lastAction.text);
+    }
+  }
+
+  // 6. Schedule next step if turn is a bot
+  scheduleBotStepIfNeeded();
 }
 
 async function submitGameAction(action, payload = {}) {
@@ -1291,12 +1408,22 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Save Player Name (Ganti Nama)
+  const nameInputEl = document.getElementById('input-player-name');
   document.getElementById('btn-save-name').addEventListener('click', () => {
-    const newName = document.getElementById('input-player-name').value.trim();
-    renamePlayer(newName);
+    renamePlayer(nameInputEl.value.trim());
   });
-  document.getElementById('input-player-name').addEventListener('keydown', (e) => {
+  nameInputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
+      renamePlayer(e.target.value.trim());
+    }
+  });
+  nameInputEl.addEventListener('change', (e) => {
+    if (e.target.value.trim() && e.target.value.trim() !== app.player.name) {
+      renamePlayer(e.target.value.trim());
+    }
+  });
+  nameInputEl.addEventListener('blur', (e) => {
+    if (e.target.value.trim() && e.target.value.trim() !== app.player.name) {
       renamePlayer(e.target.value.trim());
     }
   });
@@ -1382,6 +1509,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Create Room form submit
   document.getElementById('form-create-room').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const nameInput = document.getElementById('input-player-name');
+    if (nameInput && nameInput.value.trim() && nameInput.value.trim() !== app.player.name) {
+      await renamePlayer(nameInput.value.trim());
+    }
     const name = document.getElementById('cr-name').value.trim();
     const mode = document.getElementById('cr-mode').value;
     const maxPlayers = Number(document.getElementById('cr-max').value);
