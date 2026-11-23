@@ -192,9 +192,14 @@
 
           <!-- Lounge Action Buttons -->
           <div class="flex flex-wrap items-center justify-between gap-2 pt-3 border-t-2 border-slate-800">
-            <button id="btn-lounge-leave" class="px-4 py-2 bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 font-bold text-xs border-2 border-rose-500/40">
-              🚪 Keluar Ruangan
-            </button>
+            <div class="flex items-center gap-2">
+              <button id="btn-lounge-leave" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs border-2 border-slate-600">
+                🚪 Keluar
+              </button>
+              <button id="btn-lounge-delete" class="px-3.5 py-2 bg-rose-600/30 hover:bg-rose-600 text-rose-200 font-bold text-xs border-2 border-rose-500">
+                🗑️ Hapus Ruang
+              </button>
+            </div>
             
             <div class="flex items-center gap-2">
               <button id="btn-lounge-fill-bots" class="hidden px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-slate-600">
@@ -222,12 +227,19 @@
               <div class="text-[11px] text-slate-400 truncate" id="game-status-text">Menyiapkan meja...</div>
             </div>
           </div>
-          <div class="flex items-center gap-1.5">
+          <div class="flex items-center gap-2">
+            <!-- 60s Turn Countdown Badge -->
+            <div id="game-turn-timer-badge" class="px-2.5 py-1 bg-slate-950 border-2 border-amber-400 text-amber-300 font-mono text-xs font-bold flex items-center gap-1.5 shadow">
+              <span>⏱️</span> <span id="game-turn-timer-text">60s</span>
+            </div>
             <button id="btn-mode-rules" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 transition">
               <span>❓</span> Aturan
             </button>
             <button id="btn-restart-round" class="px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 text-xs font-semibold flex items-center gap-1 border border-emerald-500/30 transition">
               <span>🔄</span> Ronde Baru
+            </button>
+            <button id="btn-game-delete-room" class="px-2.5 py-1 rounded-lg bg-rose-600/25 hover:bg-rose-600 text-rose-200 text-xs font-semibold flex items-center gap-1 border border-rose-500/40 transition">
+              <span>🗑️</span> Hapus
             </button>
           </div>
         </div>
@@ -254,6 +266,7 @@
                 <div class="text-xs font-bold text-white flex items-center gap-1.5">
                   <span id="my-seat-name">Kamu</span>
                   <span id="my-turn-pill" class="hidden px-1.5 py-0.5 bg-amber-400 text-slate-950 text-[10px] font-extrabold">GILIRANMU</span>
+                  <span id="my-turn-timer" class="hidden px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse">⏱️ 60s</span>
                 </div>
                 <div class="text-[11px] text-amber-300 font-medium" id="my-seat-sub">0 Kartu</div>
               </div>

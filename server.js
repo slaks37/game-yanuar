@@ -85,6 +85,48 @@ async function runBotTurnsIfNeeded(roomId, g) {
   return g;
 }
 
+// Check and enforce 60s max turn timer (Auto Pass / Move if player AFK)
+async function checkAndApplyTurnTimeout(roomId, g) {
+  if (!g || g.finished || !g.turnStartedAt) return g;
+  const elapsed = Date.now() - g.turnStartedAt;
+  const limit = (g.turnTimeLimitSec || 60) * 1000;
+
+  if (elapsed >= limit) {
+    const timedOutPlayer = g.players[g.turn];
+    if (!timedOutPlayer) return g;
+
+    // Use AI decision fallback to execute optimal pass/play for timed out player
+    const decision = getBotDecision(g, g.turn);
+    if (decision) {
+      const res = processGameAction(g, g.turn, decision.action, decision.payload);
+      if (res.ok) {
+        g.turnStartedAt = Date.now();
+        g.status = `⏱️ Waktu habis (1 mnt)! ${timedOutPlayer.name} otomatis Pass/Jalan. ${g.status || ''}`;
+
+        await query(
+          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
+          [JSON.stringify(g), roomId]
+        );
+
+        await recordRoomEvent(roomId, 'GAME_UPDATE', {
+          action: 'TIMEOUT_AUTO',
+          status: g.status,
+          turn: g.turn,
+          finished: g.finished,
+          winnerText: g.winnerText
+        });
+
+        if (g.finished) {
+          await handleGameOver(roomId, g);
+        } else {
+          await runBotTurnsIfNeeded(roomId, g);
+        }
+      }
+    }
+  }
+  return g;
+}
+
 async function handleGameOver(roomId, g) {
   try {
     await query("UPDATE rooms SET status = 'finished', updated_at = NOW() WHERE id = $1", [roomId]);
@@ -305,11 +347,17 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// 4. List open rooms
+// 4. List open rooms (with 7-minute inactivity auto-cleanup)
 app.get('/api/rooms', async (req, res) => {
   try {
+    // Automatically purge inactive rooms older than 7 minutes (420 seconds) with no activity
+    await query(`
+      DELETE FROM rooms
+      WHERE updated_at < NOW() - INTERVAL '7 minutes'
+    `);
+
     const rooms = await query(`
-      SELECT r.id, r.code, r.name, r.mode, r.max_players, r.is_private, r.status, r.created_at,
+      SELECT r.id, r.code, r.name, r.mode, r.max_players, r.is_private, r.status, r.created_at, r.updated_at,
              p.name as host_name, p.avatar as host_avatar,
              COUNT(rp.player_id) as current_players
       FROM rooms r
@@ -579,7 +627,42 @@ app.post('/api/rooms/:id/fill-bots', async (req, res) => {
     }
 
     await recordRoomEvent(roomId, 'ROOM_UPDATED', {});
+    await query("UPDATE rooms SET updated_at = NOW() WHERE id = $1", [roomId]);
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 10b. Delete / Disband Room (By Host or if inactive >= 7 minutes)
+app.post('/api/rooms/:id/delete', async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const { playerId } = req.body;
+
+    const roomRes = await query('SELECT * FROM rooms WHERE id = $1', [roomId]);
+    if (roomRes.rows.length === 0) return res.json({ ok: true, message: 'Ruangan sudah tidak ada' });
+    const room = roomRes.rows[0];
+
+    const isHost = room.host_id === playerId;
+    const diffMs = Date.now() - new Date(room.updated_at).getTime();
+    const isInactive7Min = diffMs >= 7 * 60 * 1000;
+
+    if (!isHost && !isInactive7Min) {
+      return res.status(403).json({
+        error: 'Hanya host yang bisa membubarkan ruangan, atau tunggu 7 menit tanpa pergerakan.'
+      });
+    }
+
+    await recordRoomEvent(roomId, 'ROOM_DELETED', {
+      roomId,
+      reason: isHost ? 'Ruangan dibubarkan oleh Host.' : 'Ruangan otomatis dihapus karena 7 menit tidak ada pergerakan.'
+    });
+
+    await query('DELETE FROM rooms WHERE id = $1', [roomId]);
+    await query('DELETE FROM room_events WHERE room_id = $1', [roomId]);
+
+    res.json({ ok: true, message: 'Ruangan berhasil dihapus' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -643,8 +726,12 @@ app.get('/api/game/:roomId', async (req, res) => {
     if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
     let g = dbG.rows[0].state;
-    // Execute bot turns if needed
+    // Check 60s turn timer timeout & bot turns
+    g = await checkAndApplyTurnTimeout(roomId, g);
     g = await runBotTurnsIfNeeded(roomId, g);
+
+    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
+    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
 
     let pIdx = -1;
     if (playerId) {
@@ -652,7 +739,7 @@ app.get('/api/game/:roomId', async (req, res) => {
     }
 
     const sanitized = sanitizeGameStateForPlayer(g, pIdx);
-    res.json({ ok: true, game: sanitized, mySeat: pIdx, version: dbG.rows[0].version });
+    res.json({ ok: true, game: sanitized, mySeat: pIdx, version: latestVersion });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -670,10 +757,13 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
     if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
     let g = dbG.rows[0].state;
-    let version = dbG.rows[0].version;
 
-    // Check if bot needs to move
+    // Check 60s turn timeout & execute bot turns if needed
+    g = await checkAndApplyTurnTimeout(roomId, g);
     g = await runBotTurnsIfNeeded(roomId, g);
+
+    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
+    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
 
     const eventsRes = await query(
       'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
@@ -693,7 +783,7 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
       ok: true,
       game: sanitized,
       mySeat: pIdx,
-      version,
+      version: latestVersion,
       events: eventsRes.rows,
       latestEventId
     });
@@ -711,7 +801,10 @@ app.post('/api/game/:roomId/action', async (req, res) => {
     const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
     if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
-    const g = dbG.rows[0].state;
+    let g = dbG.rows[0].state;
+    // Check if timeout occurred before player acted
+    g = await checkAndApplyTurnTimeout(roomId, g);
+
     const pIdx = g.players.findIndex(p => p.playerId === playerId);
     if (pIdx === -1) return res.status(403).json({ error: 'Player not in game' });
 
@@ -720,11 +813,12 @@ app.post('/api/game/:roomId/action', async (req, res) => {
       return res.status(400).json({ error: result.error });
     }
 
-    // Save to DB
+    // Save to DB and update room activity
     await query(
       'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
       [JSON.stringify(g), roomId]
     );
+    await query("UPDATE rooms SET updated_at = NOW() WHERE id = $1", [roomId]);
 
     await recordRoomEvent(roomId, 'GAME_UPDATE', {
       action,
@@ -741,7 +835,10 @@ app.post('/api/game/:roomId/action', async (req, res) => {
       await runBotTurnsIfNeeded(roomId, g);
     }
 
-    res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx) });
+    const updatedRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
+    const finalVersion = updatedRow.rows.length > 0 ? updatedRow.rows[0].version : dbG.rows[0].version + 1;
+
+    res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx), mySeat: pIdx, version: finalVersion });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

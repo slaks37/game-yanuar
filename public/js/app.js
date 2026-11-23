@@ -386,10 +386,31 @@ function applyCosmetics() {
 }
 
 // ==================== HEARTBEAT SYNC LOOP (100% RELIABLE PVP) ====================
+let isSyncInProgress = false;
+
+async function triggerImmediateGameSync() {
+  if (app.view !== 'game' || !app.currentRoom) return;
+  try {
+    const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
+    if (res.ok && res.game) {
+      if (!res.version || res.version >= app.gameVersion) {
+        app.game = res.game;
+        app.gameVersion = res.version || app.gameVersion;
+        if (res.mySeat !== undefined && res.mySeat !== -1) {
+          app.mySeat = res.mySeat;
+        }
+        renderGameTable();
+      }
+    }
+  } catch (e) {}
+}
+
 function startHeartbeatSync() {
   if (app.syncTimer) clearInterval(app.syncTimer);
 
   app.syncTimer = setInterval(async () => {
+    if (isSyncInProgress) return; // Prevent concurrent sync overlap
+    isSyncInProgress = true;
     try {
       // 1. Lounge Sync
       if (app.view === 'lounge' && app.currentRoom) {
@@ -420,10 +441,13 @@ function startHeartbeatSync() {
       if (app.view === 'game' && app.currentRoom) {
         const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
         if (res.ok && res.game) {
-          app.game = res.game;
-          app.mySeat = res.mySeat;
-          app.gameVersion = res.version || 0;
-          renderGameTable();
+          // Strictly reject stale state overwrites
+          if (!res.version || res.version >= app.gameVersion) {
+            app.game = res.game;
+            app.mySeat = res.mySeat;
+            app.gameVersion = res.version || app.gameVersion;
+            renderGameTable();
+          }
 
           if (res.latestEventId) app.lastEventId = res.latestEventId;
           if (res.events && res.events.length > 0) {
@@ -440,6 +464,8 @@ function startHeartbeatSync() {
       }
     } catch (e) {
       console.warn('Sync loop heartbeat error:', e);
+    } finally {
+      isSyncInProgress = false;
     }
   }, 1200); // Polls every 1.2s for silky-smooth sync
 }
@@ -470,6 +496,15 @@ function handleServerEvent(type, payload) {
     switchToGameView();
   } else if (type === 'GAME_UPDATE') {
     SFX.card();
+    triggerImmediateGameSync();
+  } else if (type === 'ROOM_DELETED') {
+    SFX.alert();
+    showToast(payload.reason || 'Ruangan telah dihapus', 'warn');
+    if (app.sseSource) app.sseSource.close();
+    app.currentRoom = null;
+    app.game = null;
+    switchView('lobby');
+    refreshRoomsList();
   } else if (type === 'GAME_OVER') {
     SFX.win();
     showToast(payload.winnerText, 'success');
@@ -679,10 +714,34 @@ function renderGameTable() {
   document.getElementById('game-mode-title').textContent = mode.name;
   document.getElementById('game-status-text').textContent = g.status;
 
-  // 1. Render Opponents
+  // 1. Resolve My Player Index strictly by playerId (Prevents seat mismatch / desync)
+  let myIdx = -1;
+  if (g.players) {
+    myIdx = g.players.findIndex(p => p.playerId === app.player.id);
+  }
+  if (myIdx === -1 && app.mySeat >= 0 && app.mySeat < (g.players ? g.players.length : 0)) {
+    myIdx = app.mySeat;
+  }
+  app.mySeat = myIdx;
+
+  // Turn Timer calculation (60s max per turn)
+  const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
+  const remainingSec = Math.max(0, (g.turnTimeLimitSec || 60) - elapsedSec);
+  const timerBadgeEl = document.getElementById('game-turn-timer-text');
+  if (timerBadgeEl) {
+    timerBadgeEl.textContent = `${remainingSec}s`;
+    const parent = timerBadgeEl.parentElement;
+    if (parent) {
+      parent.classList.toggle('border-rose-500', remainingSec <= 10);
+      parent.classList.toggle('text-rose-400', remainingSec <= 10);
+      parent.classList.toggle('border-amber-400', remainingSec > 10);
+      parent.classList.toggle('text-amber-300', remainingSec > 10);
+    }
+  }
+
+  // 2. Render Opponents
   const oppBox = document.getElementById('opponents-container');
-  const myIdx = app.mySeat >= 0 ? app.mySeat : 0;
-  const opps = g.players.filter(p => p.id !== myIdx);
+  const opps = g.players.filter((p, idx) => idx !== myIdx);
 
   oppBox.innerHTML = opps.map(p => {
     const isTurn = !g.finished && g.turn === p.id;
@@ -693,11 +752,12 @@ function renderGameTable() {
 
     const isGoFishTarget = g.mode === 'gofish' && g.targetPlayerIdx === p.id;
     const clickCls = g.mode === 'gofish' ? 'cursor-pointer hover:border-amber-400' : '';
+    const turnBadge = isTurn ? `<span class="px-1 py-0.5 bg-amber-400 text-slate-950 text-[9px] font-mono font-extrabold ml-1">⏱️ ${remainingSec}s</span>` : '';
     return `
-      <div data-opp-seat="${p.id}" class="relative bg-slate-950/85 border-2 ${isGoFishTarget ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-slate-700'} ${isTurn ? 'active-turn-seat' : ''} ${clickCls} px-2.5 py-1.5 flex items-center gap-2 min-w-[112px] transition">
+      <div data-opp-seat="${p.id}" class="relative bg-slate-950/85 border-2 ${isGoFishTarget ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-slate-700'} ${isTurn ? 'active-turn-seat ring-2 ring-amber-400' : ''} ${clickCls} px-2.5 py-1.5 flex items-center gap-2 min-w-[112px] transition">
         <div class="w-8 h-8 bg-slate-800 border-2 ${p.frame || 'border-amber-400'} flex items-center justify-center text-base shrink-0">${p.avatar}</div>
         <div class="leading-tight min-w-0">
-          <div class="text-[11px] font-bold text-white truncate">${escapeHtml(p.name)}</div>
+          <div class="text-[11px] font-bold text-white truncate flex items-center">${escapeHtml(p.name)} ${turnBadge}</div>
           <div class="text-[10px] text-amber-300 font-medium">${subText}</div>
         </div>
         <div id="emote-anchor-${p.id}" class="absolute -top-4 left-1/2"></div>
@@ -714,12 +774,20 @@ function renderGameTable() {
     });
   }
 
-  // 2. Render My Seat Info
-  const me = g.players[myIdx] || { name: app.player.name, avatar: app.player.avatar, hand: [] };
+  // 3. Render My Seat Info
+  const me = (myIdx >= 0 && g.players[myIdx]) ? g.players[myIdx] : { name: app.player.name, avatar: app.player.avatar, hand: [] };
   document.getElementById('my-seat-avatar').textContent = me.avatar || app.player.avatar;
   document.getElementById('my-seat-name').textContent = me.name;
   const isMyTurn = !g.finished && g.turn === myIdx;
   document.getElementById('my-turn-pill').classList.toggle('hidden', !isMyTurn);
+  const myTurnTimer = document.getElementById('my-turn-timer');
+  if (myTurnTimer) {
+    myTurnTimer.classList.toggle('hidden', !isMyTurn);
+    myTurnTimer.textContent = `⏱️ ${remainingSec}s`;
+    myTurnTimer.className = remainingSec <= 10
+      ? 'px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse'
+      : 'px-1.5 py-0.5 bg-amber-500 text-slate-950 text-[10px] font-mono font-extrabold';
+  }
   document.getElementById('my-seat-badge').classList.toggle('active-turn-seat', isMyTurn);
 
   let mySub = `${me.hand ? me.hand.length : 0} Kartu`;
@@ -727,7 +795,7 @@ function renderGameTable() {
   else if (g.mode === 'minuman') mySub = `${me.score || 0} Tantangan`;
   document.getElementById('my-seat-sub').textContent = mySub;
 
-  // 3. Render Center Table & Actions
+  // 4. Render Center Table & Actions
   const center = document.getElementById('table-center');
   const actions = document.getElementById('action-bar');
 
@@ -947,7 +1015,73 @@ async function submitGameAction(action, payload = {}) {
 
   app.selectedCardIds.clear();
   app.game = res.game;
+  if (res.version) app.gameVersion = res.version;
+  if (res.mySeat !== undefined && res.mySeat !== -1) app.mySeat = res.mySeat;
   renderGameTable();
+}
+
+async function deleteCurrentRoom() {
+  if (!app.currentRoom) return;
+  const ok = confirm('Yakin ingin membubarkan/menghapus ruangan ini?');
+  if (!ok) return;
+
+  const res = await apiPost(`/api/rooms/${app.currentRoom.id}/delete`, {
+    playerId: app.player.id
+  });
+
+  if (res.ok) {
+    showToast('Ruangan berhasil dihapus / dibubarkan', 'info');
+    if (app.sseSource) app.sseSource.close();
+    app.currentRoom = null;
+    app.game = null;
+    switchView('lobby');
+    refreshRoomsList();
+  } else {
+    showToast(res.error || 'Gagal menghapus ruangan', 'error');
+  }
+}
+
+function startTurnCountdownTicker() {
+  if (app.tickerInterval) clearInterval(app.tickerInterval);
+  app.tickerInterval = setInterval(() => {
+    if (app.view !== 'game' || !app.game || app.game.finished) return;
+
+    const g = app.game;
+    const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
+    const limit = g.turnTimeLimitSec || 60;
+    const remainingSec = Math.max(0, limit - elapsedSec);
+
+    const timerBadgeEl = document.getElementById('game-turn-timer-text');
+    if (timerBadgeEl) {
+      timerBadgeEl.textContent = `${remainingSec}s`;
+      const parent = timerBadgeEl.parentElement;
+      if (parent) {
+        parent.classList.toggle('border-rose-500', remainingSec <= 10);
+        parent.classList.toggle('text-rose-400', remainingSec <= 10);
+        parent.classList.toggle('border-amber-400', remainingSec > 10);
+        parent.classList.toggle('text-amber-300', remainingSec > 10);
+      }
+    }
+
+    const myIdx = g.players.findIndex(p => p.playerId === app.player.id);
+    const isMyTurn = !g.finished && g.turn === myIdx;
+    const myTurnTimer = document.getElementById('my-turn-timer');
+    if (myTurnTimer) {
+      myTurnTimer.classList.toggle('hidden', !isMyTurn);
+      myTurnTimer.textContent = `⏱️ ${remainingSec}s`;
+      myTurnTimer.className = remainingSec <= 10
+        ? 'px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse'
+        : 'px-1.5 py-0.5 bg-amber-500 text-slate-950 text-[10px] font-mono font-extrabold';
+    }
+
+    // If time ran out, trigger sync so server executes auto pass/action
+    if (remainingSec === 0 && !app.isTimeoutSyncing) {
+      app.isTimeoutSyncing = true;
+      triggerImmediateGameSync().finally(() => {
+        setTimeout(() => { app.isTimeoutSyncing = false; }, 2000);
+      });
+    }
+  }, 1000);
 }
 
 // ==================== EMOTE & CHAT (SPEECH BUBBLES) ====================
@@ -1424,8 +1558,13 @@ window.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('modal-rules').classList.remove('hidden');
   });
 
-  // Start unified heartbeat sync loop
+  // Delete Room buttons (in Lounge & in Game)
+  document.getElementById('btn-lounge-delete')?.addEventListener('click', deleteCurrentRoom);
+  document.getElementById('btn-game-delete-room')?.addEventListener('click', deleteCurrentRoom);
+
+  // Start unified heartbeat sync loop & 60s turn countdown ticker
   startHeartbeatSync();
+  startTurnCountdownTicker();
 
   // Check URL query param for invite link (?join=KRT-XXXX)
   const urlParams = new URLSearchParams(window.location.search);
