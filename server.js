@@ -951,10 +951,17 @@ app.get('/api/game/:roomId', async (req, res) => {
 
     let g = dbG.rows[0].state;
     // Check 60s turn timer timeout & bot turns
-    g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
+    // A bot is advanced by /bot-step, not by GET. Avoid pointless DB writes.
+    const acting = g.players[g.turn];
+    const mayTimeout = !g.finished && g.turnStartedAt &&
+      !(acting?.isBot || String(acting?.playerId || '').startsWith('bot_')) &&
+      Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000;
+    if (mayTimeout) g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
 
-    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
-    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
+    // Normal sync needs no second version query; only a timed-out human might write.
+    const latestVersion = mayTimeout
+      ? (await query('SELECT version FROM game_states WHERE room_id = $1', [roomId])).rows[0]?.version || dbG.rows[0].version
+      : dbG.rows[0].version;
 
     let pIdx = -1;
     if (playerId) {
@@ -982,10 +989,17 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
     let g = dbG.rows[0].state;
 
     // Check 60s turn timeout & execute bot turns if needed
-    g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
+    // A bot is advanced by /bot-step, not by GET. Avoid pointless DB writes.
+    const acting = g.players[g.turn];
+    const mayTimeout = !g.finished && g.turnStartedAt &&
+      !(acting?.isBot || String(acting?.playerId || '').startsWith('bot_')) &&
+      Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000;
+    if (mayTimeout) g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
 
-    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
-    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
+    // Normal sync needs no second version query; only a timed-out human might write.
+    const latestVersion = mayTimeout
+      ? (await query('SELECT version FROM game_states WHERE room_id = $1', [roomId])).rows[0]?.version || dbG.rows[0].version
+      : dbG.rows[0].version;
 
     const eventsRes = await query(
       'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
@@ -999,8 +1013,12 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
       pIdx = g.players.findIndex(p => p.playerId === playerId);
     }
 
-    const sanitized = sanitizeGameStateForPlayer(g, pIdx);
+    // The client already has this version. Transfer only new events, not the full
+    // deck/players JSON on every heartbeat.
+    const changed = Number(latestVersion) !== clientVersion;
+    const sanitized = changed ? sanitizeGameStateForPlayer(g, pIdx) : null;
 
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
       game: sanitized,
