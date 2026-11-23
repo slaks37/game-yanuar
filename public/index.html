@@ -24,20 +24,22 @@
     </div>
 
     <div class="flex items-center gap-1.5">
+      <!-- Auth Button / User Info -->
+      <button id="btn-auth-open" class="px-2.5 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/35 text-sky-300 text-xs font-semibold flex items-center gap-1 border border-sky-500/30 transition">
+        <span>🔑</span>
+        <span id="header-auth-label">Masuk / Daftar</span>
+      </button>
+
       <button id="btn-sound" title="Suara Efek" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition">
         <span class="text-sm leading-none">🔊</span>
       </button>
       <button id="btn-leaderboard" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-yellow-300 text-xs font-semibold flex items-center gap-1.5 border border-yellow-500/25 transition">
         <span class="text-sm leading-none">🏆</span>
-        <span class="hidden sm:inline">Top Skor</span>
+        <span class="hidden sm:inline">Papan Skor</span>
       </button>
       <button id="btn-customize" class="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold flex items-center gap-1.5 border border-amber-500/25 transition">
         <span class="text-sm leading-none">🎨</span>
-        <span class="hidden sm:inline">Skin & Avatar</span>
-      </button>
-      <button id="btn-unity-bp" class="hidden md:flex px-2.5 py-1.5 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-300 text-xs font-semibold items-center gap-1.5 border border-indigo-500/30 transition">
-        <span class="text-sm leading-none">📐</span>
-        <span>Blueprint</span>
+        <span class="hidden sm:inline">Kustomisasi</span>
       </button>
       <button id="btn-toggle-chat" class="relative px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition">
         <span class="text-sm leading-none">💬</span>
@@ -60,17 +62,27 @@
       <!-- ==================== LOBBY VIEW ==================== -->
       <section id="view-lobby" class="max-w-5xl w-full mx-auto space-y-5">
         
-        <!-- Player Profile Card (Synced with Neon DB) -->
+        <!-- Player Profile Card with Name Edit, Highscore, and DB Sync -->
         <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pixel-box">
           <div class="flex items-center gap-3.5">
-            <div id="lobby-avatar-preview" class="w-14 h-14 rounded-2xl flex items-center justify-center text-3xl bg-slate-800 border-2 border-amber-400 shadow-lg shrink-0">
+            <div id="lobby-avatar-preview" class="w-14 h-14 rounded-2xl flex items-center justify-center text-3xl bg-slate-800 border-2 border-amber-400 shadow-lg shrink-0 cursor-pointer" title="Klik untuk ganti avatar">
               🦊
             </div>
             <div>
               <div class="flex items-center gap-2 flex-wrap">
-                <input id="input-player-name" type="text" value="Pemain-1" maxlength="16"
-                  class="bg-slate-800/90 border border-slate-700 focus:border-amber-400 outline-none rounded-lg px-2.5 py-1 text-sm font-bold text-white w-40" />
-                <button id="btn-save-name" class="px-2 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold rounded">Simpan</button>
+                <!-- Rename Input Form -->
+                <div class="flex items-center gap-1">
+                  <input id="input-player-name" type="text" value="Pemain-1" maxlength="20" placeholder="Ganti namamu..."
+                    class="bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-2.5 py-1 text-sm font-bold text-amber-300 w-40" />
+                  <button id="btn-save-name" class="px-2.5 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold border-2 border-black">
+                    Simpan Nama
+                  </button>
+                </div>
+
+                <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-yellow-500/15 text-yellow-300 border border-yellow-500/30 flex items-center gap-1">
+                  <span>🏆 Highscore:</span>
+                  <strong id="lobby-highscore-count">2.500</strong>
+                </span>
                 <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30">
                   <span id="lobby-chips-count">2.500</span> Koin
                 </span>
@@ -78,8 +90,12 @@
                   <span id="lobby-wins-count">0</span> Menang / <span id="lobby-matches-count">0</span> Main
                 </span>
               </div>
-              <p class="text-xs text-slate-400 mt-1.5">
-                Kartu: <span id="lobby-skin-label" class="text-amber-300 font-semibold">Klasik Royal</span> · Meja: <span id="lobby-table-label" class="text-emerald-300 font-semibold">Zamrud Klasik</span> · Server: <span class="text-emerald-400 font-semibold">game.newsystem.space</span>
+              <p class="text-xs text-slate-400 mt-1.5 flex items-center gap-2 flex-wrap">
+                <span>Akun: <strong id="lobby-account-badge" class="text-sky-300 font-bold">Tamu (Belum Login)</strong></span>
+                <span>·</span>
+                <span>Kartu: <span id="lobby-skin-label" class="text-amber-300 font-semibold">Klasik Royal</span></span>
+                <span>·</span>
+                <span>Meja: <span id="lobby-table-label" class="text-emerald-300 font-semibold">Zamrud Klasik</span></span>
               </p>
             </div>
           </div>
@@ -165,7 +181,9 @@
           <div>
             <div class="flex items-center justify-between mb-2">
               <span class="text-xs font-bold text-slate-300">Pemain di Kursi Meja (<span id="lounge-seated-count">1</span>/<span id="lounge-max-count">4</span>):</span>
-              <span class="text-[11px] text-amber-300">Semua pemain bisa chat & berikan emote di kanan 💬</span>
+              <span class="text-[11px] text-amber-300 flex items-center gap-1">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live Sync Aktif
+              </span>
             </div>
             <div id="lounge-seats-grid" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <!-- Rendered by JS -->
@@ -180,7 +198,7 @@
             
             <div class="flex items-center gap-2">
               <button id="btn-lounge-fill-bots" class="hidden px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-slate-600">
-                🤖 Isi Sisa dengan Bot
+                🤖 Isi Sisa Kursi dengan Bot
               </button>
               <button id="btn-lounge-ready" class="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs border-2 border-black">
                 ✅ Saya Siap!
@@ -240,6 +258,7 @@
                 <div class="text-[11px] text-amber-300 font-medium" id="my-seat-sub">0 Kartu</div>
               </div>
               <div id="my-emote-anchor" class="absolute -top-6 left-1/2"></div>
+              <div id="my-speech-anchor" class="absolute -top-10 left-1/2"></div>
             </div>
 
             <!-- Action Buttons Bar -->
@@ -249,15 +268,38 @@
           </div>
         </div>
 
-        <!-- PLAYER HAND + EMOTE BAR -->
+        <!-- PLAYER HAND + IN-GAME CHAT & EMOTE STRIP -->
         <div class="bg-slate-900/95 pixel-box p-3 space-y-2.5">
+          <!-- Hand cards -->
           <div id="player-hand" class="flex items-end justify-start sm:justify-center gap-1.5 overflow-x-auto pb-1 pt-4 min-h-[112px]">
             <!-- Cards rendered by JS -->
           </div>
-          <div class="flex items-center justify-between gap-2 border-t-2 border-slate-800 pt-2">
-            <span class="text-[11px] font-semibold text-slate-400 shrink-0">Emote Cepat:</span>
-            <div id="emote-bar" class="flex items-center gap-1.5 overflow-x-auto pb-0.5">
-              <!-- Emote buttons rendered by JS -->
+
+          <!-- In-Game Quick Chat & Emotes Bar -->
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-t-2 border-slate-800 pt-2">
+            <div class="flex items-center gap-1 overflow-x-auto pb-1 sm:pb-0">
+              <span class="text-[10px] font-bold text-amber-300 shrink-0">Chat Meja:</span>
+              <button class="ingame-quick-chat px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 border border-slate-700">Ayo! ⏱️</button>
+              <button class="ingame-quick-chat px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 border border-slate-700">Bohong! 🤨</button>
+              <button class="ingame-quick-chat px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 border border-slate-700">Kartu bagus! 🔥</button>
+              <button class="ingame-quick-chat px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 border border-slate-700">GGWP! 👏</button>
+              <button class="ingame-quick-chat px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 border border-slate-700">Wkwk 😂</button>
+            </div>
+
+            <!-- In-Game Mini Input -->
+            <form id="ingame-mini-chat-form" class="flex items-center gap-1">
+              <input id="ingame-mini-chat-input" type="text" placeholder="Ketik pesan cepat..." maxlength="60"
+                class="bg-slate-950 border border-slate-700 focus:border-amber-400 outline-none px-2 py-1 text-xs text-white w-36 sm:w-48" />
+              <button type="submit" class="px-2.5 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs border border-black">
+                Kirim
+              </button>
+            </form>
+
+            <div class="flex items-center gap-1 shrink-0">
+              <span class="text-[10px] font-semibold text-slate-400">Emote:</span>
+              <div id="emote-bar" class="flex items-center gap-1 overflow-x-auto">
+                <!-- Emotes rendered by JS -->
+              </div>
             </div>
           </div>
         </div>
@@ -293,6 +335,71 @@
         </button>
       </form>
     </aside>
+  </div>
+
+  <!-- ==================== MODAL: AUTH (LOGIN & REGISTER) ==================== -->
+  <div id="modal-auth" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+    <div class="bg-slate-900 pixel-box max-w-sm w-full p-5 space-y-4">
+      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
+        <div class="flex items-center gap-2">
+          <button id="auth-tab-login" class="pixel-font text-xs text-amber-300 border-b-2 border-amber-400 pb-1">
+            MASUK
+          </button>
+          <span class="text-slate-600">|</span>
+          <button id="auth-tab-register" class="pixel-font text-xs text-slate-400 pb-1">
+            DAFTAR AKUN
+          </button>
+        </div>
+        <button data-close-modal="modal-auth" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
+      </div>
+
+      <!-- Form Login -->
+      <form id="form-auth-login" class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Username</label>
+          <input id="login-username" type="text" required placeholder="Username..." maxlength="20"
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-white" />
+        </div>
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Password</label>
+          <input id="login-password" type="password" required placeholder="Password..." maxlength="32"
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-white" />
+        </div>
+        <div id="login-error" class="hidden text-rose-400 text-[11px] font-bold"></div>
+        <div class="pt-2 flex justify-between items-center">
+          <button type="button" id="btn-logout" class="hidden text-rose-400 text-xs font-bold underline">Logout</button>
+          <button type="submit" class="ml-auto px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold border-2 border-black">
+            Masuk
+          </button>
+        </div>
+      </form>
+
+      <!-- Form Register -->
+      <form id="form-auth-register" class="hidden space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Username (Unik)</label>
+          <input id="reg-username" type="text" required placeholder="Contoh: yanuar_kartu" maxlength="20"
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-emerald-400 outline-none px-3 py-2 text-white" />
+          <p class="text-[10px] text-slate-500 mt-0.5">3–20 karakter huruf, angka, underscore.</p>
+        </div>
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Nama Tampilan di Meja</label>
+          <input id="reg-name" type="text" placeholder="Nama..." maxlength="20"
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-emerald-400 outline-none px-3 py-2 text-white font-bold" />
+        </div>
+        <div>
+          <label class="block text-slate-400 font-bold mb-1">Password</label>
+          <input id="reg-password" type="password" required placeholder="Minimal 4 karakter..." minlength="4" maxlength="32"
+            class="w-full bg-slate-950 border-2 border-slate-700 focus:border-emerald-400 outline-none px-3 py-2 text-white" />
+        </div>
+        <div id="reg-error" class="hidden text-rose-400 text-[11px] font-bold"></div>
+        <div class="pt-2 flex justify-end">
+          <button type="submit" class="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold border-2 border-black">
+            Daftar & Masuk
+          </button>
+        </div>
+      </form>
+    </div>
   </div>
 
   <!-- ==================== MODAL: BUAT RUANGAN ==================== -->
@@ -371,15 +478,17 @@
     </div>
   </div>
 
-  <!-- ==================== MODAL: LEADERBOARD ==================== -->
+  <!-- ==================== MODAL: LEADERBOARD / HIGHSCORE ==================== -->
   <div id="modal-leaderboard" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
-    <div class="bg-slate-900 pixel-box max-w-lg w-full max-h-[85vh] overflow-y-auto p-5 space-y-4">
+    <div class="bg-slate-900 pixel-box max-w-xl w-full max-h-[85vh] overflow-y-auto p-5 space-y-4">
       <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
         <h3 class="pixel-font text-xs text-yellow-300 flex items-center gap-2">
-          <span>🏆</span> PAPAN PERINGKAT SERVER (NEON DB)
+          <span>🏆</span> PAPAN SKOR TERTINGGI (HIGHSCORE)
         </h3>
         <button data-close-modal="modal-leaderboard" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
       </div>
+
+      <p class="text-[11px] text-slate-400">Peringkat skor tertinggi pemain di server Neon PostgreSQL. Menangkan ronde untuk meningkatkan Highscore!</p>
 
       <div id="leaderboard-list" class="space-y-2 text-xs">
         <!-- Rendered by JS -->
@@ -392,7 +501,7 @@
     <div class="bg-slate-900 pixel-box max-w-xl w-full max-h-[88vh] overflow-y-auto p-5 space-y-5">
       <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
         <h3 class="pixel-font text-xs text-amber-300 flex items-center gap-2">
-          <span>✨</span> SKIN KARTU & AVATAR
+          <span>✨</span> KUSTOMISASI SKIN & AVATAR
         </h3>
         <button data-close-modal="modal-customize" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
       </div>
@@ -433,29 +542,6 @@
         <button data-close-modal="modal-rules" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
       </div>
       <p id="rules-modal-body" class="text-xs text-slate-200 leading-relaxed whitespace-pre-line"></p>
-    </div>
-  </div>
-
-  <!-- ==================== MODAL: BLUEPRINT UNITY ==================== -->
-  <div id="modal-unity" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
-    <div class="bg-slate-900 pixel-box max-w-2xl w-full max-h-[88vh] overflow-y-auto p-5 space-y-4">
-      <div class="flex items-center justify-between border-b-2 border-slate-800 pb-2">
-        <h3 class="pixel-font text-xs text-indigo-300 flex items-center gap-2">
-          <span>📐</span> BLUEPRINT UNITY & VERCEL
-        </h3>
-        <button data-close-modal="modal-unity" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600">✕</button>
-      </div>
-
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-        <div class="bg-slate-800/80 border-2 border-slate-700 p-3 space-y-1.5">
-          <div class="font-bold text-indigo-300">1. Client Unity (C# + URP 2D Pixel)</div>
-          <p class="text-slate-300 leading-relaxed">Codebase Unity untuk export <strong>.APK/.AAB</strong> (Android) dan <strong>.IPA</strong> (iOS). Connect via WebSocket atau REST SSE ke <code>game.newsystem.space</code>.</p>
-        </div>
-        <div class="bg-slate-800/80 border-2 border-slate-700 p-3 space-y-1.5">
-          <div class="font-bold text-emerald-300">2. Backend Vercel + Neon DB</div>
-          <p class="text-slate-300 leading-relaxed">Serverless Engine terhubung ke Neon PostgreSQL di region Singapore (ap-southeast-1) dengan Server-Sent Events real-time synchronization.</p>
-        </div>
-      </div>
     </div>
   </div>
 

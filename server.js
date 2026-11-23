@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
 const { query } = require('./lib/db');
 const { initGame, processGameAction, sanitizeGameStateForPlayer } = require('./lib/engine/games');
 const { getBotDecision } = require('./lib/engine/bots');
@@ -10,71 +11,78 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// In-memory active game state cache for ultra-fast turns & SSE broadcast, synced with DB
-const activeGames = new Map(); // roomId -> { state, timer }
+// Password hashing helper
+function hashPassword(password) {
+  const salt = 'carena_pixel_salt_2026';
+  return crypto.scryptSync(password, salt, 32).toString('hex');
+}
+
+// In-memory SSE clients per instance (for instant pushes when on same container)
 const sseClients = new Map(); // roomId -> Set(res)
 
-function broadcastEvent(roomId, eventType, payload) {
-  // Save event to DB in background
-  query(
-    'INSERT INTO room_events (room_id, event_type, payload) VALUES ($1, $2, $3)',
-    [roomId, eventType, JSON.stringify(payload)]
-  ).catch(err => console.error('Failed to log room event:', err));
+async function recordRoomEvent(roomId, eventType, payload) {
+  try {
+    const res = await query(
+      'INSERT INTO room_events (room_id, event_type, payload) VALUES ($1, $2, $3) RETURNING id, created_at',
+      [roomId, eventType, JSON.stringify(payload)]
+    );
+    const eventId = res.rows[0]?.id;
 
-  // Push to SSE clients
-  const clients = sseClients.get(roomId);
-  if (clients && clients.size > 0) {
-    const data = `data: ${JSON.stringify({ type: eventType, payload, timestamp: Date.now() })}\n\n`;
-    for (const res of clients) {
-      try {
-        res.write(data);
-      } catch (e) {
-        clients.delete(res);
+    // Push to local SSE clients if any
+    const clients = sseClients.get(roomId);
+    if (clients && clients.size > 0) {
+      const data = `data: ${JSON.stringify({ id: eventId, type: eventType, payload, timestamp: Date.now() })}\n\n`;
+      for (const client of clients) {
+        try {
+          client.write(data);
+        } catch (e) {
+          clients.delete(client);
+        }
       }
     }
+    return eventId;
+  } catch (err) {
+    console.error('Failed to log room event:', err);
+    return null;
   }
 }
 
-// Bot auto-play loop if current turn is a bot
-function checkAndRunBot(roomId) {
-  const g = activeGames.get(roomId);
-  if (!g || g.finished) return;
+// Execute bot turn on authoritative state in Neon DB
+async function runBotTurnsIfNeeded(roomId, g) {
+  let steps = 0;
+  while (!g.finished && steps < 8) {
+    const currentPl = g.players[g.turn];
+    if (!currentPl || !currentPl.isBot) break;
 
-  const currentPl = g.players[g.turn];
-  if (!currentPl || !currentPl.isBot) return;
+    const decision = getBotDecision(g, g.turn);
+    if (!decision) break;
 
-  clearTimeout(g.botTimer);
-  g.botTimer = setTimeout(async () => {
-    try {
-      const decision = getBotDecision(g, g.turn);
-      if (!decision) return;
+    const res = processGameAction(g, g.turn, decision.action, decision.payload);
+    if (!res.ok) break;
 
-      const res = processGameAction(g, g.turn, decision.action, decision.payload);
-      if (res.ok) {
-        // Update DB
-        await query(
-          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-          [JSON.stringify(g), roomId]
-        );
+    steps++;
+  }
 
-        broadcastEvent(roomId, 'GAME_UPDATE', {
-          status: g.status,
-          turn: g.turn,
-          finished: g.finished,
-          winnerText: g.winnerText,
-          mode: g.mode
-        });
+  if (steps > 0) {
+    // Save updated state to DB
+    await query(
+      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
+      [JSON.stringify(g), roomId]
+    );
 
-        if (g.finished) {
-          handleGameOver(roomId, g);
-        } else {
-          checkAndRunBot(roomId);
-        }
-      }
-    } catch (err) {
-      console.error('Error running bot turn:', err);
+    await recordRoomEvent(roomId, 'GAME_UPDATE', {
+      status: g.status,
+      turn: g.turn,
+      finished: g.finished,
+      winnerText: g.winnerText,
+      mode: g.mode
+    });
+
+    if (g.finished) {
+      await handleGameOver(roomId, g);
     }
-  }, 1200);
+  }
+  return g;
 }
 
 async function handleGameOver(roomId, g) {
@@ -85,7 +93,13 @@ async function handleGameOver(roomId, g) {
       const winner = g.players[g.winnerIdx];
       if (winner && !winner.isBot) {
         await query(
-          'UPDATE players SET coins = coins + 500, wins = wins + 1, matches = matches + 1, last_active_at = NOW() WHERE id = $1',
+          `UPDATE players
+           SET coins = coins + 500,
+               highscore = GREATEST(COALESCE(highscore, 0), coins + 500),
+               wins = wins + 1,
+               matches = matches + 1,
+               last_active_at = NOW()
+           WHERE id = $1`,
           [winner.playerId]
         );
       }
@@ -95,13 +109,18 @@ async function handleGameOver(roomId, g) {
     for (const p of g.players) {
       if (!p.isBot && (g.winnerIdx === null || p.id !== g.winnerIdx)) {
         await query(
-          'UPDATE players SET coins = coins + 50, matches = matches + 1, last_active_at = NOW() WHERE id = $1',
+          `UPDATE players
+           SET coins = coins + 50,
+               highscore = GREATEST(COALESCE(highscore, 0), coins + 50),
+               matches = matches + 1,
+               last_active_at = NOW()
+           WHERE id = $1`,
           [p.playerId]
         );
       }
     }
 
-    broadcastEvent(roomId, 'GAME_OVER', {
+    await recordRoomEvent(roomId, 'GAME_OVER', {
       winnerIdx: g.winnerIdx,
       winnerText: g.winnerText,
       status: g.status
@@ -123,7 +142,119 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// 2. Player sync / login
+// 2. Auth: Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password, name, avatar, frame } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username dan password wajib diisi!' });
+    }
+
+    const cleanUsername = username.trim().toLowerCase();
+    if (cleanUsername.length < 3 || cleanUsername.length > 20) {
+      return res.status(400).json({ error: 'Username harus 3–20 karakter!' });
+    }
+    if (!/^[a-z0-9_]+$/.test(cleanUsername)) {
+      return res.status(400).json({ error: 'Username hanya boleh huruf, angka, dan underscore!' });
+    }
+    if (password.length < 4) {
+      return res.status(400).json({ error: 'Password minimal 4 karakter!' });
+    }
+
+    const check = await query('SELECT id FROM players WHERE LOWER(username) = $1', [cleanUsername]);
+    if (check.rows.length > 0) {
+      return res.status(409).json({ error: 'Username ini sudah terdaftar! Silakan login.' });
+    }
+
+    const newId = 'usr_' + Date.now() + '_' + Math.floor(100 + Math.random() * 900);
+    const passHash = hashPassword(password);
+    const displayName = (name && name.trim()) || username.trim();
+
+    const insert = await query(
+      `INSERT INTO players (id, username, password_hash, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'skin-royal', 'table-emerald', 2500, 2500, 0, 0, NOW())
+       RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, created_at`,
+      [newId, cleanUsername, passHash, displayName, avatar || '🦊', frame || 'border-amber-400']
+    );
+
+    res.json({ ok: true, player: insert.rows[0] });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2b. Auth: Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username dan password wajib diisi!' });
+    }
+
+    const cleanUsername = username.trim().toLowerCase();
+    const result = await query(
+      `SELECT id, username, password_hash, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, created_at
+       FROM players WHERE LOWER(username) = $1`,
+      [cleanUsername]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Username tidak ditemukan!' });
+    }
+
+    const player = result.rows[0];
+    const passHash = hashPassword(password);
+    if (player.password_hash !== passHash) {
+      return res.status(401).json({ error: 'Password salah!' });
+    }
+
+    await query('UPDATE players SET last_active_at = NOW() WHERE id = $1', [player.id]);
+
+    delete player.password_hash;
+    res.json({ ok: true, player });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2c. Player Rename (Ganti Nama)
+app.post('/api/player/rename', async (req, res) => {
+  try {
+    const { id, name } = req.body;
+    if (!id || !name || !name.trim()) {
+      return res.status(400).json({ error: 'Nama tidak boleh kosong!' });
+    }
+
+    const cleanName = name.trim().slice(0, 24);
+    const update = await query(
+      `UPDATE players
+       SET name = $2, last_active_at = NOW()
+       WHERE id = $1
+       RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
+      [id, cleanName]
+    );
+
+    if (update.rows.length === 0) {
+      return res.status(404).json({ error: 'Player tidak ditemukan' });
+    }
+
+    const updatedPlayer = update.rows[0];
+
+    // Find any room player is in and broadcast
+    const roomsSeated = await query('SELECT DISTINCT room_id, seat FROM room_players WHERE player_id = $1', [id]);
+    for (const r of roomsSeated.rows) {
+      await recordRoomEvent(r.room_id, 'PLAYER_NAME_CHANGED', { playerId: id, name: cleanName, seat: r.seat });
+    }
+
+    res.json({ ok: true, player: updatedPlayer });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2d. Player sync (profile, skins, highscore update)
 app.post('/api/player/sync', async (req, res) => {
   try {
     const { id, name, avatar, frame, skin, tableSkin } = req.body;
@@ -132,8 +263,9 @@ app.post('/api/player/sync', async (req, res) => {
     const existing = await query('SELECT * FROM players WHERE id = $1', [id]);
     if (existing.rows.length === 0) {
       const insert = await query(
-        `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, wins, matches, last_active_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 2500, 0, 0, NOW()) RETURNING *`,
+        `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 2500, 2500, 0, 0, NOW())
+         RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
         [id, name, avatar || '🦊', frame || 'border-amber-400', skin || 'skin-royal', tableSkin || 'table-emerald']
       );
       return res.json({ ok: true, player: insert.rows[0] });
@@ -141,8 +273,15 @@ app.post('/api/player/sync', async (req, res) => {
 
     const update = await query(
       `UPDATE players
-       SET name = $2, avatar = $3, frame = $4, skin = $5, table_skin = $6, last_active_at = NOW()
-       WHERE id = $1 RETURNING *`,
+       SET name = $2,
+           avatar = $3,
+           frame = $4,
+           skin = $5,
+           table_skin = $6,
+           highscore = GREATEST(COALESCE(highscore, 0), coins),
+           last_active_at = NOW()
+       WHERE id = $1
+       RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
       [id, name, avatar || existing.rows[0].avatar, frame || existing.rows[0].frame, skin || existing.rows[0].skin, tableSkin || existing.rows[0].table_skin]
     );
     res.json({ ok: true, player: update.rows[0] });
@@ -151,11 +290,14 @@ app.post('/api/player/sync', async (req, res) => {
   }
 });
 
-// 3. Leaderboard
+// 3. Leaderboard / Highscore
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const list = await query(
-      'SELECT id, name, avatar, frame, coins, wins, matches FROM players ORDER BY wins DESC, coins DESC LIMIT 20'
+      `SELECT id, name, username, avatar, frame, coins, COALESCE(highscore, coins) as highscore, wins, matches
+       FROM players
+       ORDER BY COALESCE(highscore, coins) DESC, wins DESC, coins DESC
+       LIMIT 30`
     );
     res.json({ ok: true, leaderboard: list.rows });
   } catch (err) {
@@ -257,6 +399,50 @@ app.get('/api/rooms/:id', async (req, res) => {
   }
 });
 
+// 6b. Room Lounge Sync (High-Frequency Poll for 100% reliable real-time lounge sync)
+app.get('/api/rooms/:id/sync', async (req, res) => {
+  try {
+    const roomId = req.params.id;
+    const sinceEventId = Number(req.query.since || 0);
+
+    const roomRes = await query('SELECT id, code, name, host_id, mode, max_players, is_private, status FROM rooms WHERE id = $1 OR code = $1', [roomId]);
+    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Ruangan tidak ditemukan' });
+
+    const room = roomRes.rows[0];
+
+    const playersRes = await query(`
+      SELECT rp.seat, rp.is_ready, rp.is_host, rp.is_bot, rp.bot_profile,
+             COALESCE(p.id, rp.player_id) as id,
+             COALESCE(p.name, rp.bot_profile->>'name') as name,
+             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar,
+             COALESCE(p.frame, rp.bot_profile->>'frame') as frame,
+             COALESCE(p.skin, 'skin-royal') as skin,
+             COALESCE(p.table_skin, 'table-emerald') as table_skin
+      FROM room_players rp
+      LEFT JOIN players p ON rp.player_id = p.id
+      WHERE rp.room_id = $1
+      ORDER BY rp.seat ASC
+    `, [room.id]);
+
+    const eventsRes = await query(
+      'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
+      [room.id, sinceEventId]
+    );
+
+    const latestEventId = eventsRes.rows.length > 0 ? eventsRes.rows[eventsRes.rows.length - 1].id : sinceEventId;
+
+    res.json({
+      ok: true,
+      room,
+      players: playersRes.rows,
+      events: eventsRes.rows,
+      latestEventId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 7. Join Room
 app.post('/api/rooms/:id/join', async (req, res) => {
   try {
@@ -306,7 +492,7 @@ app.post('/api/rooms/:id/join', async (req, res) => {
     const playerInfo = await query('SELECT name, avatar FROM players WHERE id = $1', [playerId]);
     const pName = playerInfo.rows[0]?.name || 'Pemain';
 
-    broadcastEvent(room.id, 'PLAYER_JOINED', {
+    await recordRoomEvent(room.id, 'PLAYER_JOINED', {
       playerId,
       name: pName,
       seat: targetSeat
@@ -325,11 +511,10 @@ app.post('/api/rooms/:id/leave', async (req, res) => {
     const { playerId } = req.body;
     await query('DELETE FROM room_players WHERE room_id = $1 AND player_id = $2', [roomId, playerId]);
 
-    // Check if any players left
+    // Check if any human players left
     const remaining = await query('SELECT * FROM room_players WHERE room_id = $1 AND is_bot = FALSE', [roomId]);
     if (remaining.rows.length === 0) {
       await query('DELETE FROM rooms WHERE id = $1', [roomId]);
-      activeGames.delete(roomId);
     } else {
       // Transfer host if host left
       const room = (await query('SELECT host_id FROM rooms WHERE id = $1', [roomId])).rows[0];
@@ -338,7 +523,7 @@ app.post('/api/rooms/:id/leave', async (req, res) => {
         await query('UPDATE rooms SET host_id = $1 WHERE id = $2', [newHost.player_id, roomId]);
         await query('UPDATE room_players SET is_host = TRUE WHERE room_id = $1 AND player_id = $2', [roomId, newHost.player_id]);
       }
-      broadcastEvent(roomId, 'PLAYER_LEFT', { playerId });
+      await recordRoomEvent(roomId, 'PLAYER_LEFT', { playerId });
     }
 
     res.json({ ok: true });
@@ -353,7 +538,7 @@ app.post('/api/rooms/:id/ready', async (req, res) => {
     const roomId = req.params.id;
     const { playerId, isReady } = req.body;
     await query('UPDATE room_players SET is_ready = $1 WHERE room_id = $2 AND player_id = $3', [!!isReady, roomId, playerId]);
-    broadcastEvent(roomId, 'PLAYER_READY', { playerId, isReady: !!isReady });
+    await recordRoomEvent(roomId, 'PLAYER_READY', { playerId, isReady: !!isReady });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -393,7 +578,7 @@ app.post('/api/rooms/:id/fill-bots', async (req, res) => {
       }
     }
 
-    broadcastEvent(roomId, 'ROOM_UPDATED', {});
+    await recordRoomEvent(roomId, 'ROOM_UPDATED', {});
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -423,11 +608,10 @@ app.post('/api/rooms/:id/start', async (req, res) => {
     `, [roomId]);
 
     if (playersRes.rows.length < 2) {
-      return res.status(400).json({ error: 'Minimal butuh 2 pemain atau tambahkan bot!' });
+      return res.status(400).json({ error: 'Minimal butuh 2 pemain atau isi slot kosong dengan bot!' });
     }
 
     const gameState = initGame(room.mode, playersRes.rows);
-    activeGames.set(roomId, gameState);
 
     await query(
       `INSERT INTO game_states (room_id, version, state, updated_at)
@@ -438,8 +622,10 @@ app.post('/api/rooms/:id/start', async (req, res) => {
 
     await query("UPDATE rooms SET status = 'playing', updated_at = NOW() WHERE id = $1", [roomId]);
 
-    broadcastEvent(roomId, 'GAME_START', { mode: room.mode });
-    checkAndRunBot(roomId);
+    await recordRoomEvent(roomId, 'GAME_START', { mode: room.mode });
+
+    // Check if starter is bot
+    await runBotTurnsIfNeeded(roomId, gameState);
 
     res.json({ ok: true });
   } catch (err) {
@@ -453,25 +639,64 @@ app.get('/api/game/:roomId', async (req, res) => {
     const roomId = req.params.roomId;
     const playerId = req.query.playerId;
 
-    let g = activeGames.get(roomId);
-    if (!g) {
-      const dbG = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
-      if (dbG.rows.length > 0) {
-        g = dbG.rows[0].state;
-        activeGames.set(roomId, g);
-      }
-    }
+    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
-    if (!g) return res.status(404).json({ error: 'Game not found' });
+    let g = dbG.rows[0].state;
+    // Execute bot turns if needed
+    g = await runBotTurnsIfNeeded(roomId, g);
 
-    // Find seat index of requesting player
     let pIdx = -1;
     if (playerId) {
       pIdx = g.players.findIndex(p => p.playerId === playerId);
     }
 
     const sanitized = sanitizeGameStateForPlayer(g, pIdx);
-    res.json({ ok: true, game: sanitized, mySeat: pIdx });
+    res.json({ ok: true, game: sanitized, mySeat: pIdx, version: dbG.rows[0].version });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 12b. Game State Sync (High-Frequency Poll for 100% reliable turn/card/event sync)
+app.get('/api/game/:roomId/sync', async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const playerId = req.query.playerId;
+    const clientVersion = Number(req.query.version || 0);
+    const sinceEventId = Number(req.query.since || 0);
+
+    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+    let g = dbG.rows[0].state;
+    let version = dbG.rows[0].version;
+
+    // Check if bot needs to move
+    g = await runBotTurnsIfNeeded(roomId, g);
+
+    const eventsRes = await query(
+      'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
+      [roomId, sinceEventId]
+    );
+
+    const latestEventId = eventsRes.rows.length > 0 ? eventsRes.rows[eventsRes.rows.length - 1].id : sinceEventId;
+
+    let pIdx = -1;
+    if (playerId) {
+      pIdx = g.players.findIndex(p => p.playerId === playerId);
+    }
+
+    const sanitized = sanitizeGameStateForPlayer(g, pIdx);
+
+    res.json({
+      ok: true,
+      game: sanitized,
+      mySeat: pIdx,
+      version,
+      events: eventsRes.rows,
+      latestEventId
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -483,17 +708,10 @@ app.post('/api/game/:roomId/action', async (req, res) => {
     const roomId = req.params.roomId;
     const { playerId, action, payload } = req.body;
 
-    let g = activeGames.get(roomId);
-    if (!g) {
-      const dbG = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
-      if (dbG.rows.length > 0) {
-        g = dbG.rows[0].state;
-        activeGames.set(roomId, g);
-      }
-    }
+    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
-    if (!g) return res.status(404).json({ error: 'Game not found' });
-
+    const g = dbG.rows[0].state;
     const pIdx = g.players.findIndex(p => p.playerId === playerId);
     if (pIdx === -1) return res.status(403).json({ error: 'Player not in game' });
 
@@ -508,7 +726,7 @@ app.post('/api/game/:roomId/action', async (req, res) => {
       [JSON.stringify(g), roomId]
     );
 
-    broadcastEvent(roomId, 'GAME_UPDATE', {
+    await recordRoomEvent(roomId, 'GAME_UPDATE', {
       action,
       status: g.status,
       turn: g.turn,
@@ -517,9 +735,10 @@ app.post('/api/game/:roomId/action', async (req, res) => {
     });
 
     if (g.finished) {
-      handleGameOver(roomId, g);
+      await handleGameOver(roomId, g);
     } else {
-      checkAndRunBot(roomId);
+      // Execute bot turns if next is bot
+      await runBotTurnsIfNeeded(roomId, g);
     }
 
     res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx) });
@@ -528,7 +747,7 @@ app.post('/api/game/:roomId/action', async (req, res) => {
   }
 });
 
-// 14. Real-time Server-Sent Events (SSE) Stream
+// 14. Server-Sent Events (SSE) Stream
 app.get('/api/events/:roomId', (req, res) => {
   const roomId = req.params.roomId;
 
@@ -544,10 +763,9 @@ app.get('/api/events/:roomId', (req, res) => {
 
   res.write(`data: ${JSON.stringify({ type: 'CONNECTED', timestamp: Date.now() })}\n\n`);
 
-  // Heartbeat every 20s to keep connection alive
   const heartbeat = setInterval(() => {
     res.write(': heartbeat\n\n');
-  }, 20000);
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(heartbeat);
@@ -568,10 +786,24 @@ app.post('/api/events/:roomId/chat', async (req, res) => {
 
     const p = (await query('SELECT name, avatar FROM players WHERE id = $1', [playerId])).rows[0] || { name: 'Pemain', avatar: '🦊' };
 
-    broadcastEvent(roomId, 'CHAT', {
+    let seat = -1;
+    const dbG = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
+    if (dbG.rows.length > 0) {
+      const g = dbG.rows[0].state;
+      const plIdx = g.players.findIndex(pl => pl.playerId === playerId);
+      if (plIdx !== -1) seat = plIdx;
+    }
+    if (seat === -1) {
+      const rp = await query('SELECT seat FROM room_players WHERE room_id = $1 AND player_id = $2', [roomId, playerId]);
+      if (rp.rows.length > 0) seat = rp.rows[0].seat;
+    }
+
+    await recordRoomEvent(roomId, 'CHAT', {
+      playerId,
       sender: p.name,
       avatar: p.avatar,
-      message: message.trim()
+      message: message.trim(),
+      seat
     });
 
     res.json({ ok: true });
@@ -586,7 +818,7 @@ app.post('/api/events/:roomId/emote', async (req, res) => {
     const roomId = req.params.roomId;
     const { playerId, seat, emote } = req.body;
 
-    broadcastEvent(roomId, 'EMOTE', {
+    await recordRoomEvent(roomId, 'EMOTE', {
       playerId,
       seat,
       emote

@@ -117,7 +117,6 @@ const EMOTES = [
 
 const SUITS = ['♦', '♣', '♥', '♠'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-const CAPSA_RANK_ORDER = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2'];
 
 // ==================== APP STATE ====================
 const app = {
@@ -125,27 +124,32 @@ const app = {
   player: {
     id: localStorage.getItem('carena_player_id') || ('usr_' + Math.floor(100000 + Math.random() * 900000)),
     name: localStorage.getItem('carena_player_name') || ('Pemain-' + Math.floor(100 + Math.random() * 900)),
+    username: localStorage.getItem('carena_player_username') || null,
     avatar: localStorage.getItem('carena_player_avatar') || '🦊',
     frame: localStorage.getItem('carena_player_frame') || 'border-amber-400',
     skin: localStorage.getItem('carena_skin') || 'skin-royal',
     tableSkin: localStorage.getItem('carena_table_skin') || 'table-emerald',
     coins: 2500,
+    highscore: 2500,
     wins: 0,
     matches: 0
   },
-  currentRoom: null, // Room object
-  roomPlayers: [], // Players in lounge
+  currentRoom: null, // Active room object
+  roomPlayers: [], // Seated players in lounge
   mySeat: -1,
   game: null, // Active game state
+  gameVersion: 0,
+  lastEventId: 0,
   selectedCardIds: new Set(),
   chatOpen: false,
   unreadChat: 0,
   sseSource: null,
-  roomPollInterval: null,
+  syncTimer: null,
   pendingJoinRoom: null
 };
 
 localStorage.setItem('carena_player_id', app.player.id);
+localStorage.setItem('carena_player_name', app.player.name);
 
 // ==================== UTILITIES ====================
 function escapeHtml(str) {
@@ -164,7 +168,7 @@ function showToast(msg, type = 'info') {
   const borderCol = type === 'error' ? 'border-rose-500 text-rose-300' :
     type === 'warn' ? 'border-amber-400 text-amber-300' :
     type === 'success' ? 'border-emerald-400 text-emerald-300' : 'border-sky-400 text-sky-200';
-  t.className = `bg-slate-950/95 border-2 ${borderCol} px-3.5 py-2 text-xs font-bold shadow-2xl flex items-center gap-2 pixel-box animate-pulse`;
+  t.className = `bg-slate-950/95 border-2 ${borderCol} px-3.5 py-2 text-xs font-bold shadow-2xl flex items-center gap-2 pixel-box`;
   t.innerHTML = `<span>${type === 'error' ? '⚠️' : type === 'success' ? '✅' : 'ℹ️'}</span><span>${escapeHtml(msg)}</span>`;
   box.appendChild(t);
   setTimeout(() => { t.remove(); }, 3200);
@@ -210,7 +214,7 @@ function isSevenUpPlayable(card, board) {
   return num === lane.low - 1 || num === lane.high + 1;
 }
 
-// ==================== NETWORKING & SERVER SYNC ====================
+// ==================== API HELPERS ====================
 async function apiPost(endpoint, data = {}) {
   try {
     const res = await fetch(endpoint, {
@@ -235,29 +239,142 @@ async function apiGet(endpoint) {
   }
 }
 
+// ==================== AUTH & PLAYER MANAGEMENT ====================
 async function syncPlayerWithDB() {
   const res = await apiPost('/api/player/sync', app.player);
   if (res && res.ok && res.player) {
-    app.player.coins = res.player.coins;
-    app.player.wins = res.player.wins;
-    app.player.matches = res.player.matches;
-    updatePlayerUI();
+    applyPlayerProfile(res.player);
   }
 }
 
-function updatePlayerUI() {
-  document.getElementById('input-player-name').value = app.player.name;
-  document.getElementById('lobby-avatar-preview').textContent = app.player.avatar;
-  document.getElementById('lobby-chips-count').textContent = Number(app.player.coins).toLocaleString('id-ID');
-  document.getElementById('lobby-wins-count').textContent = app.player.wins;
-  document.getElementById('lobby-matches-count').textContent = app.player.matches;
+function applyPlayerProfile(p) {
+  app.player.id = p.id;
+  app.player.name = p.name;
+  app.player.username = p.username || null;
+  app.player.avatar = p.avatar || '🦊';
+  app.player.frame = p.frame || 'border-amber-400';
+  app.player.skin = p.skin || 'skin-royal';
+  app.player.tableSkin = p.table_skin || 'table-emerald';
+  app.player.coins = p.coins !== undefined ? p.coins : 2500;
+  app.player.highscore = p.highscore !== undefined ? p.highscore : p.coins;
+  app.player.wins = p.wins || 0;
+  app.player.matches = p.matches || 0;
 
-  const skinObj = CARD_SKINS.find(s => s.id === app.player.skin);
+  localStorage.setItem('carena_player_id', app.player.id);
+  localStorage.setItem('carena_player_name', app.player.name);
+  if (app.player.username) {
+    localStorage.setItem('carena_player_username', app.player.username);
+  } else {
+    localStorage.removeItem('carena_player_username');
+  }
+
+  updatePlayerUI();
+}
+
+function updatePlayerUI() {
+  const p = app.player;
+  document.getElementById('input-player-name').value = p.name;
+  document.getElementById('lobby-avatar-preview').textContent = p.avatar;
+  document.getElementById('lobby-chips-count').textContent = Number(p.coins).toLocaleString('id-ID');
+  document.getElementById('lobby-highscore-count').textContent = Number(p.highscore).toLocaleString('id-ID');
+  document.getElementById('lobby-wins-count').textContent = p.wins;
+  document.getElementById('lobby-matches-count').textContent = p.matches;
+
+  const authLabel = document.getElementById('header-auth-label');
+  const accountBadge = document.getElementById('lobby-account-badge');
+  const btnLogout = document.getElementById('btn-logout');
+
+  if (p.username) {
+    authLabel.textContent = `@${p.username}`;
+    accountBadge.textContent = `@${p.username} (Terdaftar)`;
+    accountBadge.className = 'text-emerald-400 font-bold';
+    btnLogout?.classList.remove('hidden');
+  } else {
+    authLabel.textContent = 'Masuk / Daftar';
+    accountBadge.textContent = 'Tamu (Belum Login)';
+    accountBadge.className = 'text-sky-300 font-bold';
+    btnLogout?.classList.add('hidden');
+  }
+
+  const skinObj = CARD_SKINS.find(s => s.id === p.skin);
   if (skinObj) document.getElementById('lobby-skin-label').textContent = skinObj.name;
-  const tableObj = TABLE_SKINS.find(t => t.id === app.player.tableSkin);
+  const tableObj = TABLE_SKINS.find(t => t.id === p.tableSkin);
   if (tableObj) document.getElementById('lobby-table-label').textContent = tableObj.name;
 
   applyCosmetics();
+}
+
+async function renamePlayer(newName) {
+  if (!newName || !newName.trim()) {
+    showToast('Nama tidak boleh kosong!', 'warn');
+    return;
+  }
+  const res = await apiPost('/api/player/rename', {
+    id: app.player.id,
+    name: newName.trim()
+  });
+
+  if (res.ok && res.player) {
+    applyPlayerProfile(res.player);
+    showToast(`Nama berhasil diubah menjadi "${res.player.name}"!`, 'success');
+  } else {
+    showToast(res.error || 'Gagal mengubah nama', 'error');
+  }
+}
+
+async function loginPlayer(username, password) {
+  const res = await apiPost('/api/auth/login', { username, password });
+  if (res.ok && res.player) {
+    applyPlayerProfile(res.player);
+    document.getElementById('modal-auth').classList.add('hidden');
+    showToast(`Selamat datang kembali, ${res.player.name}!`, 'success');
+    return true;
+  } else {
+    const errBox = document.getElementById('login-error');
+    errBox.textContent = res.error || 'Login gagal!';
+    errBox.classList.remove('hidden');
+    SFX.alert();
+    return false;
+  }
+}
+
+async function registerPlayer(username, password, name) {
+  const res = await apiPost('/api/auth/register', {
+    username,
+    password,
+    name: name || username,
+    avatar: app.player.avatar,
+    frame: app.player.frame
+  });
+
+  if (res.ok && res.player) {
+    applyPlayerProfile(res.player);
+    document.getElementById('modal-auth').classList.add('hidden');
+    showToast(`Akun @${res.player.username} berhasil dibuat & masuk!`, 'success');
+    return true;
+  } else {
+    const errBox = document.getElementById('reg-error');
+    errBox.textContent = res.error || 'Pendaftaran gagal!';
+    errBox.classList.remove('hidden');
+    SFX.alert();
+    return false;
+  }
+}
+
+function logoutPlayer() {
+  localStorage.removeItem('carena_player_username');
+  app.player.username = null;
+  app.player.id = 'usr_' + Math.floor(100000 + Math.random() * 900000);
+  app.player.name = 'Pemain-' + Math.floor(100 + Math.random() * 900);
+  app.player.coins = 2500;
+  app.player.highscore = 2500;
+  app.player.wins = 0;
+  app.player.matches = 0;
+  localStorage.setItem('carena_player_id', app.player.id);
+  localStorage.setItem('carena_player_name', app.player.name);
+  updatePlayerUI();
+  document.getElementById('modal-auth').classList.add('hidden');
+  showToast('Anda telah logout dan menggunakan mode Tamu.', 'info');
 }
 
 function applyCosmetics() {
@@ -268,53 +385,100 @@ function applyCosmetics() {
   body.classList.add(app.player.tableSkin);
 }
 
-// ==================== REAL-TIME SSE CONNECTION ====================
-function connectRoomSSE(roomId) {
-  if (app.sseSource) {
-    app.sseSource.close();
-  }
+// ==================== HEARTBEAT SYNC LOOP (100% RELIABLE PVP) ====================
+function startHeartbeatSync() {
+  if (app.syncTimer) clearInterval(app.syncTimer);
 
-  app.sseSource = new EventSource(`/api/events/${roomId}`);
-
-  app.sseSource.onmessage = (event) => {
+  app.syncTimer = setInterval(async () => {
     try {
-      const data = JSON.parse(event.data);
-      handleServerEvent(data.type, data.payload);
-    } catch (e) {
-      console.warn('Failed to parse SSE event:', e);
-    }
-  };
+      // 1. Lounge Sync
+      if (app.view === 'lounge' && app.currentRoom) {
+        const res = await apiGet(`/api/rooms/${app.currentRoom.id}/sync?since=${app.lastEventId}`);
+        if (res.ok && res.room) {
+          app.currentRoom = res.room;
+          app.roomPlayers = res.players || [];
+          renderLounge();
 
-  app.sseSource.onerror = (err) => {
-    console.warn('SSE connection error, fallback polling active.');
-  };
+          // CRITICAL: If host started the game, other party switches IMMEDIATELY!
+          if (res.room.status === 'playing') {
+            SFX.card();
+            showToast('Host telah memulai permainan! Memasuki meja...', 'success');
+            switchToGameView();
+            return;
+          }
+
+          if (res.latestEventId) app.lastEventId = res.latestEventId;
+          if (res.events && res.events.length > 0) {
+            for (const ev of res.events) {
+              handleServerEvent(ev.event_type, ev.payload);
+            }
+          }
+        }
+      }
+
+      // 2. Game Sync
+      if (app.view === 'game' && app.currentRoom) {
+        const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
+        if (res.ok && res.game) {
+          app.game = res.game;
+          app.mySeat = res.mySeat;
+          app.gameVersion = res.version || 0;
+          renderGameTable();
+
+          if (res.latestEventId) app.lastEventId = res.latestEventId;
+          if (res.events && res.events.length > 0) {
+            for (const ev of res.events) {
+              handleServerEvent(ev.event_type, ev.payload);
+            }
+          }
+        }
+      }
+
+      // 3. Lobby Auto-Refresh
+      if (app.view === 'lobby') {
+        refreshRoomsList();
+      }
+    } catch (e) {
+      console.warn('Sync loop heartbeat error:', e);
+    }
+  }, 1200); // Polls every 1.2s for silky-smooth sync
+}
+
+// ==================== SSE CONNECTION ====================
+function connectRoomSSE(roomId) {
+  if (app.sseSource) app.sseSource.close();
+  try {
+    app.sseSource = new EventSource(`/api/events/${roomId}`);
+    app.sseSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.id && data.id > app.lastEventId) app.lastEventId = data.id;
+        handleServerEvent(data.type, data.payload);
+      } catch (e) {}
+    };
+  } catch (e) {}
 }
 
 function handleServerEvent(type, payload) {
-  console.log('SSE Event:', type, payload);
-
   if (type === 'PLAYER_JOINED') {
-    showToast(`${payload.name} bergabung ke ruangan!`, 'info');
-    fetchRoomLoungeData();
+    showToast(`${payload.name} bergabung ke kursi ${payload.seat + 1}!`, 'info');
   } else if (type === 'PLAYER_LEFT') {
     showToast('Seorang pemain keluar dari ruangan.', 'info');
-    fetchRoomLoungeData();
-  } else if (type === 'PLAYER_READY' || type === 'ROOM_UPDATED') {
-    fetchRoomLoungeData();
   } else if (type === 'GAME_START') {
     SFX.card();
     showToast('Permainan dimulai!', 'success');
     switchToGameView();
   } else if (type === 'GAME_UPDATE') {
     SFX.card();
-    fetchGameState();
   } else if (type === 'GAME_OVER') {
     SFX.win();
     showToast(payload.winnerText, 'success');
     syncPlayerWithDB();
-    fetchGameState();
   } else if (type === 'CHAT') {
     addChatMessage(payload.sender, payload.avatar, payload.message);
+    if (payload.seat !== undefined && payload.seat !== null) {
+      triggerSpeechBubble(payload.seat, payload.message);
+    }
   } else if (type === 'EMOTE') {
     triggerSeatEmote(payload.seat, payload.emote);
   }
@@ -324,15 +488,12 @@ function handleServerEvent(type, payload) {
 async function refreshRoomsList() {
   const container = document.getElementById('rooms-list');
   const res = await apiGet('/api/rooms');
-  if (!res.ok || !res.rooms) {
-    container.innerHTML = `<div class="col-span-full py-4 text-center text-rose-400 text-xs">Gagal memuat ruangan. Klik tombol 🔄 untuk coba lagi.</div>`;
-    return;
-  }
+  if (!res.ok || !res.rooms) return;
 
   if (res.rooms.length === 0) {
     container.innerHTML = `
       <div class="col-span-full py-6 text-center text-slate-400 text-xs space-y-2">
-        <p>Belum ada ruangan yang aktif saat ini.</p>
+        <p>Belum ada ruangan aktif saat ini.</p>
         <button id="btn-empty-create" class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold border-2 border-black">
           ➕ Buat Ruangan Pertama
         </button>
@@ -371,7 +532,7 @@ async function refreshRoomsList() {
             👥 <strong>${r.current_players}</strong> / ${r.max_players} Kursi
           </span>
           <button data-join-room-id="${r.id}" data-is-private="${r.is_private}" class="px-3 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">
-            ${isPlaying ? 'Tonton / Masuk' : 'Gabung'}
+            ${isPlaying ? 'Masuk Meja' : 'Gabung'}
           </button>
         </div>
       </div>`;
@@ -394,6 +555,7 @@ async function refreshRoomsList() {
 }
 
 async function joinRoom(roomIdent, password = '') {
+  showToast('Menghubungkan ke ruangan...', 'info');
   const res = await apiPost(`/api/rooms/${roomIdent}/join`, {
     playerId: app.player.id,
     password
@@ -407,6 +569,7 @@ async function joinRoom(roomIdent, password = '') {
 
   app.currentRoom = res.room;
   app.mySeat = res.seat;
+  app.lastEventId = 0;
   connectRoomSSE(res.room.id);
 
   if (res.room.status === 'playing') {
@@ -415,17 +578,6 @@ async function joinRoom(roomIdent, password = '') {
     switchToLoungeView();
   }
   return true;
-}
-
-async function fetchRoomLoungeData() {
-  if (!app.currentRoom) return;
-  const res = await apiGet(`/api/rooms/${app.currentRoom.id}`);
-  if (!res.ok || !res.room) return;
-
-  app.currentRoom = res.room;
-  app.roomPlayers = res.players || [];
-
-  renderLounge();
 }
 
 function renderLounge() {
@@ -502,25 +654,22 @@ function switchView(viewName) {
 
 function switchToLoungeView() {
   switchView('lounge');
-  fetchRoomLoungeData();
+  renderLounge();
 }
 
-function switchToGameView() {
+async function switchToGameView() {
   switchView('game');
-  fetchGameState();
+  if (app.currentRoom) {
+    const res = await apiGet(`/api/game/${app.currentRoom.id}?playerId=${app.player.id}`);
+    if (res.ok && res.game) {
+      app.game = res.game;
+      app.mySeat = res.mySeat;
+      renderGameTable();
+    }
+  }
 }
 
-// ==================== IN-GAME LOGIC & RENDERING ====================
-async function fetchGameState() {
-  if (!app.currentRoom) return;
-  const res = await apiGet(`/api/game/${app.currentRoom.id}?playerId=${app.player.id}`);
-  if (!res.ok || !res.game) return;
-
-  app.game = res.game;
-  app.mySeat = res.mySeat;
-  renderGameTable();
-}
-
+// ==================== IN-GAME TABLE RENDERING ====================
 function renderGameTable() {
   const g = app.game;
   if (!g) return;
@@ -552,6 +701,7 @@ function renderGameTable() {
           <div class="text-[10px] text-amber-300 font-medium">${subText}</div>
         </div>
         <div id="emote-anchor-${p.id}" class="absolute -top-4 left-1/2"></div>
+        <div id="speech-anchor-${p.id}" class="absolute -top-8 left-1/2"></div>
       </div>`;
   }).join('');
 
@@ -572,7 +722,7 @@ function renderGameTable() {
   document.getElementById('my-turn-pill').classList.toggle('hidden', !isMyTurn);
   document.getElementById('my-seat-badge').classList.toggle('active-turn-seat', isMyTurn);
 
-  let mySub = `${me.hand.length} Kartu`;
+  let mySub = `${me.hand ? me.hand.length : 0} Kartu`;
   if (g.mode === 'gofish') mySub = `${me.hand.length} Kartu · ${me.books || 0} Book`;
   else if (g.mode === 'minuman') mySub = `${me.score || 0} Tantangan`;
   document.getElementById('my-seat-sub').textContent = mySub;
@@ -612,11 +762,10 @@ function renderGameTable() {
       submitGameAction('pass');
     });
   } else if (g.mode === 'setan') {
-    // Find prev active
     let prevIdx = -1;
     for (let step = 1; step < g.players.length; step++) {
       const idx = (myIdx - step + g.players.length) % g.players.length;
-      if (g.players[idx].handCount > 0 || g.players[idx].hand.length > 0) {
+      if (g.players[idx].handCount > 0 || (g.players[idx].hand && g.players[idx].hand.length > 0)) {
         prevIdx = idx;
         break;
       }
@@ -801,7 +950,7 @@ async function submitGameAction(action, payload = {}) {
   renderGameTable();
 }
 
-// ==================== EMOTE & CHAT SYSTEM ====================
+// ==================== EMOTE & CHAT (SPEECH BUBBLES) ====================
 function triggerSeatEmote(seatIdx, emote) {
   SFX.emote();
   const anchor = seatIdx === app.mySeat
@@ -814,6 +963,29 @@ function triggerSeatEmote(seatIdx, emote) {
   bub.textContent = emote;
   anchor.appendChild(bub);
   setTimeout(() => bub.remove(), 2400);
+}
+
+function triggerSpeechBubble(seatIdx, text) {
+  SFX.chat();
+  const anchor = seatIdx === app.mySeat
+    ? document.getElementById('my-speech-anchor')
+    : document.getElementById(`speech-anchor-${seatIdx}`);
+
+  if (!anchor) return;
+  const bubble = document.createElement('div');
+  bubble.className = 'speech-bubble';
+  bubble.textContent = text;
+  anchor.appendChild(bubble);
+  setTimeout(() => bubble.remove(), 4500);
+}
+
+function sendChatMessage(msg) {
+  if (!app.currentRoom || !msg || !msg.trim()) return;
+  apiPost(`/api/events/${app.currentRoom.id}/chat`, {
+    playerId: app.player.id,
+    message: msg.trim()
+  });
+  triggerSpeechBubble(app.mySeat, msg.trim());
 }
 
 function sendEmote(emote) {
@@ -846,10 +1018,10 @@ function addChatMessage(sender, avatar, text) {
   }
 }
 
-// ==================== LEADERBOARD ====================
+// ==================== LEADERBOARD / HIGHSCORE MODAL ====================
 async function showLeaderboard() {
   const list = document.getElementById('leaderboard-list');
-  list.innerHTML = '<div class="py-4 text-center text-slate-400">Memuat peringkat dari database...</div>';
+  list.innerHTML = '<div class="py-4 text-center text-slate-400">Memuat peringkat dari server Neon...</div>';
   document.getElementById('modal-leaderboard').classList.remove('hidden');
 
   const res = await apiGet('/api/leaderboard');
@@ -860,19 +1032,23 @@ async function showLeaderboard() {
 
   list.innerHTML = res.leaderboard.map((p, idx) => {
     const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `#${idx + 1}`;
+    const userTag = p.username ? `<span class="text-[10px] text-sky-400 font-normal">@${escapeHtml(p.username)}</span>` : '';
     return `
       <div class="bg-slate-950 border border-slate-800 p-2.5 flex items-center justify-between gap-3">
         <div class="flex items-center gap-2.5 min-w-0">
-          <span class="pixel-font text-xs text-amber-300 w-6">${medal}</span>
-          <span class="text-xl">${p.avatar}</span>
+          <span class="pixel-font text-xs text-amber-300 w-7 text-center shrink-0">${medal}</span>
+          <div class="w-8 h-8 bg-slate-800 border-2 ${p.frame || 'border-amber-400'} flex items-center justify-center text-base shrink-0">${p.avatar || '🦊'}</div>
           <div class="truncate">
-            <div class="font-bold text-white text-xs truncate">${escapeHtml(p.name)}</div>
-            <div class="text-[10px] text-slate-400">${p.matches || 0} Pertandingan</div>
+            <div class="font-bold text-white text-xs truncate flex items-center gap-1.5">
+              <span>${escapeHtml(p.name)}</span>
+              ${userTag}
+            </div>
+            <div class="text-[10px] text-slate-400">${p.wins || 0} Menang · ${p.matches || 0} Pertandingan</div>
           </div>
         </div>
         <div class="text-right shrink-0">
-          <div class="text-xs font-bold text-amber-300">${p.wins || 0} Menang</div>
-          <div class="text-[10px] text-emerald-400">${Number(p.coins || 0).toLocaleString('id-ID')} Koin</div>
+          <div class="text-xs font-bold text-yellow-300">🏆 ${Number(p.highscore || p.coins || 0).toLocaleString('id-ID')}</div>
+          <div class="text-[10px] text-slate-400">${Number(p.coins || 0).toLocaleString('id-ID')} Koin</div>
         </div>
       </div>`;
   }).join('');
@@ -925,9 +1101,9 @@ function renderCustomizeModal() {
   });
 }
 
-// ==================== INITIALIZATION & EVENT WIRING ====================
+// ==================== EVENT WIRING & INITIALIZATION ====================
 window.addEventListener('DOMContentLoaded', async () => {
-  // Sync player profile with Neon DB
+  // Sync initial profile
   await syncPlayerWithDB();
 
   // Populate Mode Cards in Lobby
@@ -964,15 +1140,13 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Emote Bar
   document.getElementById('emote-bar').innerHTML = EMOTES.map(e => `
-    <button data-emote="${e.icon}" class="w-8 h-8 bg-slate-950 border-2 border-slate-700 hover:border-amber-400 flex items-center justify-center text-lg transition" title="${e.label}">
+    <button data-emote="${e.icon}" class="w-7 h-7 bg-slate-950 border border-slate-700 hover:border-amber-400 flex items-center justify-center text-sm transition" title="${e.label}">
       ${e.icon}
     </button>
   `).join('');
 
   document.querySelectorAll('[data-emote]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      sendEmote(btn.dataset.emote);
-    });
+    btn.addEventListener('click', () => sendEmote(btn.dataset.emote));
   });
 
   // Sound Toggle
@@ -982,18 +1156,80 @@ window.addEventListener('DOMContentLoaded', async () => {
     showToast(on ? 'Suara diaktifkan' : 'Suara dimatikan');
   });
 
-  // Save Player Name
+  // Save Player Name (Ganti Nama)
   document.getElementById('btn-save-name').addEventListener('click', () => {
     const newName = document.getElementById('input-player-name').value.trim();
-    if (newName) {
-      app.player.name = newName;
-      localStorage.setItem('carena_player_name', newName);
-      syncPlayerWithDB();
-      showToast('Nama pemain disimpan!', 'success');
+    renamePlayer(newName);
+  });
+  document.getElementById('input-player-name').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      renamePlayer(e.target.value.trim());
     }
   });
 
-  // Refresh Rooms
+  // Auth Modal Tabs & Actions
+  const btnAuthOpen = document.getElementById('btn-auth-open');
+  const modalAuth = document.getElementById('modal-auth');
+  const tabLogin = document.getElementById('auth-tab-login');
+  const tabReg = document.getElementById('auth-tab-register');
+  const formLogin = document.getElementById('form-auth-login');
+  const formReg = document.getElementById('form-auth-register');
+
+  btnAuthOpen.addEventListener('click', () => {
+    document.getElementById('login-error').classList.add('hidden');
+    document.getElementById('reg-error').classList.add('hidden');
+    modalAuth.classList.remove('hidden');
+  });
+
+  tabLogin.addEventListener('click', () => {
+    tabLogin.className = 'pixel-font text-xs text-amber-300 border-b-2 border-amber-400 pb-1';
+    tabReg.className = 'pixel-font text-xs text-slate-400 pb-1';
+    formLogin.classList.remove('hidden');
+    formReg.classList.add('hidden');
+  });
+
+  tabReg.addEventListener('click', () => {
+    tabReg.className = 'pixel-font text-xs text-emerald-300 border-b-2 border-emerald-400 pb-1';
+    tabLogin.className = 'pixel-font text-xs text-slate-400 pb-1';
+    formReg.classList.remove('hidden');
+    formLogin.classList.add('hidden');
+  });
+
+  formLogin.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const u = document.getElementById('login-username').value.trim();
+    const p = document.getElementById('login-password').value;
+    await loginPlayer(u, p);
+  });
+
+  formReg.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const u = document.getElementById('reg-username').value.trim();
+    const name = document.getElementById('reg-name').value.trim();
+    const p = document.getElementById('reg-password').value;
+    await registerPlayer(u, p, name);
+  });
+
+  document.getElementById('btn-logout').addEventListener('click', logoutPlayer);
+
+  // In-Game Quick Chat & Form
+  document.querySelectorAll('.ingame-quick-chat').forEach(btn => {
+    btn.addEventListener('click', () => {
+      sendChatMessage(btn.textContent);
+    });
+  });
+
+  document.getElementById('ingame-mini-chat-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const inp = document.getElementById('ingame-mini-chat-input');
+    const txt = inp.value.trim();
+    if (txt) {
+      sendChatMessage(txt);
+      inp.value = '';
+    }
+  });
+
+  // Refresh Rooms Button
   document.getElementById('btn-refresh-rooms').addEventListener('click', () => {
     refreshRoomsList();
     SFX.card();
@@ -1097,7 +1333,9 @@ window.addEventListener('DOMContentLoaded', async () => {
     const res = await apiPost(`/api/rooms/${app.currentRoom.id}/start`, {
       hostId: app.player.id
     });
-    if (!res.ok) {
+    if (res.ok) {
+      switchToGameView();
+    } else {
       showToast(res.error || 'Gagal memulai permainan', 'error');
     }
   });
@@ -1116,7 +1354,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     refreshRoomsList();
   });
 
-  // Chat toggle & submit
+  // Chat Panel Toggle & Submit
   const chatPanel = document.getElementById('chat-panel');
   document.getElementById('btn-toggle-chat').addEventListener('click', () => {
     app.chatOpen = !app.chatOpen;
@@ -1136,22 +1374,13 @@ window.addEventListener('DOMContentLoaded', async () => {
     const inp = document.getElementById('chat-input');
     const msg = inp.value.trim();
     if (!msg || !app.currentRoom) return;
-    apiPost(`/api/events/${app.currentRoom.id}/chat`, {
-      playerId: app.player.id,
-      message: msg
-    });
+    sendChatMessage(msg);
     inp.value = '';
-    SFX.chat();
   });
 
   document.querySelectorAll('.quick-chat-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      if (!app.currentRoom) return;
-      apiPost(`/api/events/${app.currentRoom.id}/chat`, {
-        playerId: app.player.id,
-        message: btn.textContent
-      });
-      SFX.chat();
+      sendChatMessage(btn.textContent);
     });
   });
 
@@ -1163,12 +1392,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Leaderboard modal
-  document.getElementById('btn-leaderboard').addEventListener('click', () => {
-    showLeaderboard();
-  });
+  document.getElementById('btn-leaderboard').addEventListener('click', showLeaderboard);
 
-  // Cosmetics modal
+  // Customize modal
   document.getElementById('btn-customize').addEventListener('click', () => {
+    renderCustomizeModal();
+    document.getElementById('modal-customize').classList.remove('hidden');
+  });
+  document.getElementById('lobby-avatar-preview').addEventListener('click', () => {
     renderCustomizeModal();
     document.getElementById('modal-customize').classList.remove('hidden');
   });
@@ -1183,11 +1414,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     showToast('Kustomisasi disimpan ke database!', 'success');
   });
 
-  // Unity blueprint modal
-  document.getElementById('btn-unity-bp').addEventListener('click', () => {
-    document.getElementById('modal-unity').classList.remove('hidden');
-  });
-
   // Mode rules modal
   document.getElementById('btn-mode-rules').addEventListener('click', () => {
     const curMode = app.game ? app.game.mode : 'capsa';
@@ -1198,11 +1424,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('modal-rules').classList.remove('hidden');
   });
 
-  // Load initial rooms
-  refreshRoomsList();
-  app.roomPollInterval = setInterval(() => {
-    if (app.view === 'lobby') refreshRoomsList();
-  }, 4000);
+  // Start unified heartbeat sync loop
+  startHeartbeatSync();
 
   // Check URL query param for invite link (?join=KRT-XXXX)
   const urlParams = new URLSearchParams(window.location.search);

@@ -15,16 +15,23 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS players (
         id VARCHAR(64) PRIMARY KEY,
         name VARCHAR(32) NOT NULL,
+        username VARCHAR(32) UNIQUE,
+        password_hash VARCHAR(128),
         avatar VARCHAR(16) DEFAULT '🦊',
         frame VARCHAR(32) DEFAULT 'border-amber-400',
         skin VARCHAR(32) DEFAULT 'skin-royal',
         table_skin VARCHAR(32) DEFAULT 'table-emerald',
         coins INT DEFAULT 2500,
+        highscore INT DEFAULT 2500,
         wins INT DEFAULT 0,
         matches INT DEFAULT 0,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         last_active_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE players ADD COLUMN IF NOT EXISTS username VARCHAR(32) UNIQUE;
+      ALTER TABLE players ADD COLUMN IF NOT EXISTS password_hash VARCHAR(128);
+      ALTER TABLE players ADD COLUMN IF NOT EXISTS highscore INT DEFAULT 2500;
 
       CREATE TABLE IF NOT EXISTS rooms (
         id VARCHAR(64) PRIMARY KEY,
