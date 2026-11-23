@@ -1092,6 +1092,10 @@ app.post('/api/game/:roomId/bot-step', async (req, res) => {
 
     const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
     if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+    // Only seated human participants can drive bot turns.
+    if (!playerId || !dbG.rows[0].state.players.some(p => p.playerId === playerId && !p.isBot)) {
+      return res.status(403).json({ error: 'Hanya pemain di meja yang boleh menjalankan giliran AI.' });
+    }
 
     const step = await runBotTurnsIfNeeded(roomId, dbG.rows[0].state, Number(dbG.rows[0].version));
     const g = step.game;
