@@ -256,6 +256,13 @@
             <!-- Rendered by JS -->
           </div>
 
+          <!-- Live AI move strip: each committed bot step appears in sequence. -->
+          <div id="ai-move-stream" class="relative z-10 mx-auto my-1 w-full max-w-xl bg-slate-950/85 border border-amber-400/50 px-2.5 py-2 text-center">
+            <div class="text-[10px] font-bold tracking-wide text-amber-300">LANGKAH KARTU AI · LIVE</div>
+            <div id="ai-move-live" aria-live="polite" class="mt-1 text-[11px] text-slate-300">Menunggu langkah AI berikutnya...</div>
+            <div id="ai-move-history" class="ai-move-history mt-2 text-[10px] text-slate-400 text-left" aria-label="Riwayat langkah AI"></div>
+          </div>
+
           <!-- Center Table Board -->
           <div id="table-center" class="relative z-10 my-auto py-2 flex flex-col items-center justify-center text-center gap-2">
             <!-- Mode-specific center content -->
