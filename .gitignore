@@ -4,3 +4,5 @@ node_modules/
 .neon/
 .vercel/
 .DS_Store
+.vercel
+.env*
