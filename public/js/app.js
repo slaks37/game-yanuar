@@ -555,96 +555,53 @@ function updateTurnTimersOnly() {
   }
 }
 
-async function triggerImmediateGameSync() {
+// GET endpoints do not run AI; share one in-flight request for polling and SSE.
+async function syncGameNow() {
+  if (gameSyncPromise) return gameSyncPromise;
   if (app.view !== 'game' || !app.currentRoom) return;
-  try {
-    const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
+  const roomId = app.currentRoom.id;
+  gameSyncPromise = (async () => {
+    const res = await apiGet(`/api/game/${roomId}/sync?playerId=${encodeURIComponent(app.player.id)}&version=${app.gameVersion}&since=${app.lastEventId}`);
+    if (app.view !== 'game' || app.currentRoom?.id !== roomId) return;
     if (res.ok && res.game) {
-      const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
-      if (isNewVersion) {
-        app.game = res.game;
-        app.gameVersion = res.version || app.gameVersion;
-        if (res.mySeat !== undefined && res.mySeat !== -1) {
-          app.mySeat = res.mySeat;
-        }
-        renderGameTable();
-      } else if (app.game) {
-        app.game.turnStartedAt = res.game.turnStartedAt;
-        app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
-        updateTurnTimersOnly();
-      }
+      ingestRoomEvents(res.events, res.latestEventId);
+      applyGameSnapshot(res);
     }
-  } catch (e) {}
+  })().finally(() => { gameSyncPromise = null; });
+  return gameSyncPromise;
 }
+
+function triggerImmediateGameSync() { return syncGameNow(); }
 
 function startHeartbeatSync() {
   if (app.syncTimer) clearInterval(app.syncTimer);
-
+  let lobbyTicks = 0;
+  let loungeSignature = '';
   app.syncTimer = setInterval(async () => {
-    if (isSyncInProgress) return; // Prevent concurrent sync overlap
+    if (isSyncInProgress || document.visibilityState === 'hidden') return;
     isSyncInProgress = true;
     try {
-      // 1. Lounge Sync
       if (app.view === 'lounge' && app.currentRoom) {
-        const res = await apiGet(`/api/rooms/${app.currentRoom.id}/sync?since=${app.lastEventId}`);
+        const roomId = app.currentRoom.id;
+        const res = await apiGet(`/api/rooms/${roomId}/sync?since=${app.lastEventId}`);
+        if (app.view !== 'lounge' || app.currentRoom?.id !== roomId) return;
         if (res.ok && res.room) {
           app.currentRoom = res.room;
           app.roomPlayers = res.players || [];
-          renderLounge();
-
-          // CRITICAL: If host started the game, other party switches IMMEDIATELY!
-          if (res.room.status === 'playing') {
-            SFX.card();
-            showToast('Host telah memulai permainan! Memasuki meja...', 'success');
-            switchToGameView();
-            return;
-          }
-
-          if (res.latestEventId) app.lastEventId = res.latestEventId;
-          if (res.events && res.events.length > 0) {
-            for (const ev of res.events) {
-              handleServerEvent(ev.event_type, ev.payload);
-            }
-          }
+          const sig = JSON.stringify([res.room.status, app.roomPlayers]);
+          if (sig !== loungeSignature) { renderLounge(); loungeSignature = sig; }
+          ingestRoomEvents(res.events, res.latestEventId);
+          if (res.room.status === 'playing' && app.view === 'lounge') switchToGameView();
         }
+      } else if (app.view === 'game') {
+        await syncGameNow();
+      } else if (app.view === 'lobby' && ++lobbyTicks % 5 === 0) {
+        await refreshRoomsList();
       }
-
-      // 2. Game Sync
-      if (app.view === 'game' && app.currentRoom) {
-        const res = await apiGet(`/api/game/${app.currentRoom.id}/sync?playerId=${app.player.id}&version=${app.gameVersion}&since=${app.lastEventId}`);
-        if (res.ok && res.game) {
-          // Strictly reject stale state overwrites and prevent DOM rebuild if version hasn't changed
-          const isNewVersion = !app.game || (res.version && res.version > app.gameVersion);
-          if (isNewVersion) {
-            app.game = res.game;
-            app.mySeat = res.mySeat;
-            app.gameVersion = res.version || app.gameVersion;
-            renderGameTable();
-          } else if (app.game) {
-            app.game.turnStartedAt = res.game.turnStartedAt;
-            app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
-            updateTurnTimersOnly();
-          }
-
-          if (res.latestEventId) app.lastEventId = res.latestEventId;
-          if (res.events && res.events.length > 0) {
-            for (const ev of res.events) {
-              handleServerEvent(ev.event_type, ev.payload);
-            }
-          }
-        }
-      }
-
-      // 3. Lobby Auto-Refresh
-      if (app.view === 'lobby') {
-        refreshRoomsList();
-      }
-    } catch (e) {
-      console.warn('Sync loop heartbeat error:', e);
-    } finally {
-      isSyncInProgress = false;
-    }
-  }, 1200); // Polls every 1.2s for silky-smooth sync
+    } catch (err) {
+      console.warn('Heartbeat sync failed:', err);
+    } finally { isSyncInProgress = false; }
+  }, 1800);
 }
 
 // ==================== SSE CONNECTION ====================
@@ -655,8 +612,7 @@ function connectRoomSSE(roomId) {
     app.sseSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.id && data.id > app.lastEventId) app.lastEventId = data.id;
-        handleServerEvent(data.type, data.payload);
+        if (data.type !== 'CONNECTED') ingestRoomEvents([data]);
       } catch (e) {}
     };
   } catch (e) {}
@@ -671,9 +627,17 @@ function handleServerEvent(type, payload) {
     SFX.card();
     showToast('Permainan dimulai!', 'success');
     clearChatHistory();
+    app.game = null;
+    app.gameVersion = 0;
+    app.selectedCardIds.clear();
+    resetAiMovePlayback();
     switchToGameView();
   } else if (type === 'GAME_UPDATE') {
-    SFX.card();
+    if (payload?.move) {
+      aiMoveQueue.push(payload.move);
+      if (aiMoveQueue.length > 50) aiMoveQueue.shift();
+      playNextAiMove();
+    }
     triggerImmediateGameSync();
   } else if (type === 'ROOM_DELETED') {
     SFX.alert();
@@ -793,6 +757,11 @@ async function joinRoom(roomIdent, password = '') {
   app.currentRoom = res.room;
   app.mySeat = res.seat;
   app.lastEventId = 0;
+  app.game = null;
+  app.gameVersion = 0;
+  app.selectedCardIds.clear();
+  seenEventIds.clear();
+  resetAiMovePlayback();
   connectRoomSSE(res.room.id);
 
   if (res.reconnected) {
@@ -889,9 +858,8 @@ async function switchToGameView() {
   if (app.currentRoom) {
     const res = await apiGet(`/api/game/${app.currentRoom.id}?playerId=${app.player.id}`);
     if (res.ok && res.game) {
-      app.game = res.game;
-      app.mySeat = res.mySeat;
-      renderGameTable();
+      applyGameSnapshot(res);
+      playNextAiMove();
     }
   }
 }
