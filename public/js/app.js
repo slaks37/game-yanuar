@@ -454,7 +454,7 @@ function playNextAiMove() {
   aiMoveTimer = setTimeout(() => {
     aiMoveTimer = null;
     playNextAiMove();
-  }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 900 : 1600);
+  }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 650 : 1100);
 }
 
 function ingestRoomEvents(events, latestEventId = null) {
@@ -589,7 +589,8 @@ function startHeartbeatSync() {
         if (res.ok && res.room) {
           app.currentRoom = res.room;
           app.roomPlayers = res.players || [];
-          const sig = JSON.stringify([res.room.status, app.roomPlayers]);
+          const sig = JSON.stringify([res.room.status, app.roomPlayers.map(p =>
+            [p.id, p.seat, p.name, p.avatar, p.frame, p.is_ready, p.is_bot])]);
           if (sig !== loungeSignature) { renderLounge(); loungeSignature = sig; }
           ingestRoomEvents(res.events, res.latestEventId);
           if (res.room.status === 'playing' && app.view === 'lounge') switchToGameView();
@@ -639,7 +640,12 @@ function handleServerEvent(type, payload) {
       if (aiMoveQueue.length > 50) aiMoveQueue.shift();
       playNextAiMove();
     }
-    triggerImmediateGameSync();
+    // The authoring client receives the new snapshot from its POST already.
+    // Skip a redundant GET for every AI card; other clients still sync.
+    if (!botStepInFlight && !actionInFlight &&
+        (!payload?.version || Number(payload.version) > Number(app.gameVersion || 0))) {
+      triggerImmediateGameSync();
+    }
   } else if (type === 'ROOM_DELETED') {
     SFX.alert();
     showToast(payload.reason || 'Ruangan telah dihapus', 'warn');
