@@ -128,90 +128,97 @@ async function triggerBotMoveReaction(roomId, botPlayer, mode, action, comboLabe
   }
 }
 
-// Execute 1 bot turn step on authoritative state in Neon DB
-// Paced execution allows human players to visually see every CPU move step-by-step
-async function runBotTurnsIfNeeded(roomId, g, force = false) {
-  if (!g || g.finished) return g;
-
-  const currentPl = g.players[g.turn];
-  if (!currentPl) return g;
-  const isBot = !!(currentPl.isBot || (currentPl.playerId && String(currentPl.playerId).startsWith('bot_')));
-  if (!isBot) return g;
-
-  // Realistic pacing: ensure at least 700ms has elapsed so players can observe the previous move
-  const elapsedMs = Date.now() - (g.turnStartedAt || 0);
-  if (!force && elapsedMs < 700) {
-    return g;
+// Safe public move details: private card faces must never be emitted.
+function publicBotMove(g, bot, decision, handBefore) {
+  const action = decision?.action || 'pass';
+  const payload = decision?.payload || {};
+  const move = { seat: bot.id, name: bot.name, action, text: g.status || '', cards: [], faceDownCount: 0 };
+  if (['capsa', 'sevenup', 'empatsatu'].includes(g.mode)) {
+    const ids = action === 'play' ? (payload.cardIds || (payload.cardId ? [payload.cardId] : []))
+      : (action === 'discard' && payload.cardId ? [payload.cardId] : []);
+    move.cards = handBefore.filter(c => ids.includes(c.id))
+      .map(c => ({ id: c.id, rank: c.rank, suit: c.suit }));
+    if (g.lastAction?.by === bot.id) move.text = g.lastAction.text;
+  } else if (g.mode === 'minuman' && action === 'draw') {
+    const match = /^(10|[2-9AJQK])([♦♣♥♠])$/.exec(g.currentRule?.card || '');
+    if (match) move.cards = [{ rank: match[1], suit: match[2] }];
+  } else if (g.mode === 'bohong' && action === 'play') {
+    move.faceDownCount = Math.min(3, (payload.cardIds || []).length);
+    move.text = 'Meletakkan ' + move.faceDownCount + ' kartu tertutup (klaim)';
+  } else if (g.mode === 'setan' && action === 'draw') {
+    move.faceDownCount = 1;
+    move.text = g.lastActionText || move.text;
+  } else if (g.mode === 'blackjack' && ['hit','double'].includes(action)) {
+    move.faceDownCount = 1;
+  } else if (g.mode === 'gofish') {
+    move.text = g.lastFishLog || move.text;
   }
+  return move;
+}
 
-  currentPl.isBot = true;
-
-  const decision = getBotDecision(g, g.turn);
+// Only explicit bot-step requests may advance bots. A versioned write prevents
+// concurrent clients from skipping/repeating turns on the shared Neon state.
+async function runBotTurnsIfNeeded(roomId, g, expectedVersion) {
+  const unchanged = () => ({ game: g, version: expectedVersion });
+  if (!g || g.finished) return unchanged();
+  const bot = g.players[g.turn];
+  if (!bot || !(bot.isBot || String(bot.playerId || '').startsWith('bot_'))) return unchanged();
+  if (Date.now() - (g.turnStartedAt || 0) < 1200) return unchanged();
+  const seat = g.turn;
+  bot.isBot = true;
+  let handBefore = bot.hand.slice();
+  let decision = getBotDecision(g, seat);
+  let shown = decision;
   if (!decision) {
-    console.warn(`[Bot Warning] No decision for bot ${currentPl.name} in mode ${g.mode}. Advancing turn.`);
-    g.turn = (g.turn + 1) % g.players.length;
+    g.turn = (seat + 1) % g.players.length;
     g.turnStartedAt = Date.now();
   } else {
-    const res = processGameAction(g, g.turn, decision.action, decision.payload);
-    if (!res.ok) {
-      console.error(`[Bot Error] Action failed for bot ${currentPl.name}: ${res.error}. Forcing fallback.`);
-      if (g.mode === 'capsa') {
-        if (g.mustInclude3D) {
-          const c3d = currentPl.hand.find(c => c.rank === '3' && c.suit === '♦');
-          if (c3d) processGameAction(g, g.turn, 'play', { cardIds: [c3d.id] });
-          else g.turn = (g.turn + 1) % g.players.length;
-        } else {
-          processGameAction(g, g.turn, 'pass', {});
-        }
+    const outcome = processGameAction(g, seat, decision.action, decision.payload);
+    if (!outcome.ok) {
+      console.warn('[Bot Action Failed]', bot.name, outcome.error);
+      if (g.mode === 'capsa' && !g.mustInclude3D && processGameAction(g, seat, 'pass', {}).ok) {
+        shown = { action: 'pass', payload: {} };
       } else {
-        g.turn = (g.turn + 1) % g.players.length;
+        g.turn = (seat + 1) % g.players.length;
       }
       g.turnStartedAt = Date.now();
-    } else {
-      // In Empatsatu (41), bot needs to draw AND discard in the same turn
-      if (g.mode === 'empatsatu' && g.phase === 'discard') {
-        const discardDec = getBotDecision(g, g.turn);
-        if (discardDec) {
-          processGameAction(g, g.turn, discardDec.action, discardDec.payload);
-        }
+    } else if (g.mode === 'empatsatu' && g.phase === 'discard') {
+      const discardHand = g.players[seat].hand.slice();
+      const discard = getBotDecision(g, seat);
+      if (discard && processGameAction(g, seat, discard.action, discard.payload).ok) {
+        handBefore = discardHand;
+        shown = discard;
       }
     }
   }
-
-  // Save updated state to DB and increment version
-  await query(
-    'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-    [JSON.stringify(g), roomId]
+  const move = publicBotMove(g, bot, shown, handBefore);
+  const saved = await query(
+    'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
+    [JSON.stringify(g), roomId, expectedVersion]
   );
-
+  if (!saved.rows.length) {
+    const latest = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+    return latest.rows.length ? { game: latest.rows[0].state, version: latest.rows[0].version } : unchanged();
+  }
+  const version = saved.rows[0].version;
   await recordRoomEvent(roomId, 'GAME_UPDATE', {
-    status: g.status,
-    turn: g.turn,
-    finished: g.finished,
-    winnerText: g.winnerText,
-    mode: g.mode
+    action: shown?.action || 'pass', status: g.status, turn: g.turn, finished: g.finished,
+    winnerText: g.winnerText, mode: g.mode, version, move
   });
-
-  if (decision) {
-    triggerBotMoveReaction(roomId, currentPl, g.mode, decision.action, g.lastAction?.text, g.finished);
-  }
-
-  if (g.finished) {
-    await handleGameOver(roomId, g);
-  }
-
-  return g;
+  if (shown) void triggerBotMoveReaction(roomId, bot, g.mode, shown.action, move.text, g.finished);
+  if (g.finished) await handleGameOver(roomId, g);
+  return { game: g, version };
 }
 
 // Check and enforce 60s max turn timer (Auto Pass / Move if player AFK)
-async function checkAndApplyTurnTimeout(roomId, g) {
+async function checkAndApplyTurnTimeout(roomId, g, expectedVersion) {
   if (!g || g.finished || !g.turnStartedAt) return g;
   const elapsed = Date.now() - g.turnStartedAt;
   const limit = (g.turnTimeLimitSec || 60) * 1000;
 
   if (elapsed >= limit) {
     const timedOutPlayer = g.players[g.turn];
-    if (!timedOutPlayer) return g;
+    if (!timedOutPlayer || timedOutPlayer.isBot || String(timedOutPlayer.playerId || '').startsWith('bot_')) return g;
 
     // Use AI decision fallback to execute optimal pass/play for timed out player
     const decision = getBotDecision(g, g.turn);
@@ -221,10 +228,14 @@ async function checkAndApplyTurnTimeout(roomId, g) {
         g.turnStartedAt = Date.now();
         g.status = `⏱️ Waktu habis (1 mnt)! ${timedOutPlayer.name} otomatis Pass/Jalan. ${g.status || ''}`;
 
-        await query(
-          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-          [JSON.stringify(g), roomId]
+        const saved = await query(
+          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
+          [JSON.stringify(g), roomId, expectedVersion]
         );
+        if (!saved.rows.length) {
+          const latest = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
+          return latest.rows[0]?.state || g;
+        }
 
         await recordRoomEvent(roomId, 'GAME_UPDATE', {
           action: 'TIMEOUT_AUTO',
@@ -236,8 +247,6 @@ async function checkAndApplyTurnTimeout(roomId, g) {
 
         if (g.finished) {
           await handleGameOver(roomId, g);
-        } else {
-          await runBotTurnsIfNeeded(roomId, g);
         }
       }
     }
@@ -942,8 +951,7 @@ app.get('/api/game/:roomId', async (req, res) => {
 
     let g = dbG.rows[0].state;
     // Check 60s turn timer timeout & bot turns
-    g = await checkAndApplyTurnTimeout(roomId, g);
-    g = await runBotTurnsIfNeeded(roomId, g);
+    g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
 
     const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
     const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
@@ -974,8 +982,7 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
     let g = dbG.rows[0].state;
 
     // Check 60s turn timeout & execute bot turns if needed
-    g = await checkAndApplyTurnTimeout(roomId, g);
-    g = await runBotTurnsIfNeeded(roomId, g);
+    g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
 
     const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
     const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
@@ -1018,7 +1025,10 @@ app.post('/api/game/:roomId/action', async (req, res) => {
 
     let g = dbG.rows[0].state;
     // Check if timeout occurred before player acted
-    g = await checkAndApplyTurnTimeout(roomId, g);
+    if (g.turnStartedAt && Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000) {
+      await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
+      return res.status(409).json({ error: 'Giliran habis. Sinkronkan meja dahulu.' });
+    }
 
     const pIdx = g.players.findIndex(p => p.playerId === playerId);
     if (pIdx === -1) return res.status(403).json({ error: 'Player not in game' });
@@ -1029,10 +1039,11 @@ app.post('/api/game/:roomId/action', async (req, res) => {
     }
 
     // Save to DB and update room activity
-    await query(
-      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-      [JSON.stringify(g), roomId]
+    const saved = await query(
+      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
+      [JSON.stringify(g), roomId, dbG.rows[0].version]
     );
+    if (!saved.rows.length) return res.status(409).json({ error: 'Meja sudah berubah. Sinkronkan dan ulangi aksi.' });
     await query("UPDATE rooms SET updated_at = NOW() WHERE id = $1", [roomId]);
 
     await recordRoomEvent(roomId, 'GAME_UPDATE', {
@@ -1047,8 +1058,7 @@ app.post('/api/game/:roomId/action', async (req, res) => {
       await handleGameOver(roomId, g);
     }
 
-    const updatedRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
-    const finalVersion = updatedRow.rows.length > 0 ? updatedRow.rows[0].version : dbG.rows[0].version + 1;
+    const finalVersion = saved.rows[0].version;
 
     res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx), mySeat: pIdx, version: finalVersion });
   } catch (err) {
@@ -1065,12 +1075,9 @@ app.post('/api/game/:roomId/bot-step', async (req, res) => {
     const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
     if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
-    let g = dbG.rows[0].state;
-    g = await checkAndApplyTurnTimeout(roomId, g);
-    g = await runBotTurnsIfNeeded(roomId, g);
-
-    const vRow = await query('SELECT version FROM game_states WHERE room_id = $1', [roomId]);
-    const latestVersion = vRow.rows.length > 0 ? vRow.rows[0].version : dbG.rows[0].version;
+    const step = await runBotTurnsIfNeeded(roomId, dbG.rows[0].state, Number(dbG.rows[0].version));
+    const g = step.game;
+    const latestVersion = step.version;
 
     let pIdx = -1;
     if (playerId) {
