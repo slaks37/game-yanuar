@@ -563,9 +563,10 @@ async function syncGameNow() {
   gameSyncPromise = (async () => {
     const res = await apiGet(`/api/game/${roomId}/sync?playerId=${encodeURIComponent(app.player.id)}&version=${app.gameVersion}&since=${app.lastEventId}`);
     if (app.view !== 'game' || app.currentRoom?.id !== roomId) return;
-    if (res.ok && res.game) {
+    if (res.ok) {
+      // Delta sync omits game when the version has not changed.
       ingestRoomEvents(res.events, res.latestEventId);
-      applyGameSnapshot(res);
+      if (res.game) applyGameSnapshot(res);
     }
   })().finally(() => { gameSyncPromise = null; });
   return gameSyncPromise;
@@ -1172,24 +1173,26 @@ function renderGameTable() {
 }
 
 async function submitGameAction(action, payload = {}) {
-  if (!app.currentRoom) return;
-  const res = await apiPost(`/api/game/${app.currentRoom.id}/action`, {
-    playerId: app.player.id,
-    action,
-    payload
-  });
-
-  if (!res.ok) {
-    SFX.alert();
-    showToast(res.error || 'Aksi kartu tidak valid!', 'error');
-    return;
+  // Double taps must not submit duplicate moves or overwrite a newer snapshot.
+  if (!app.currentRoom || actionInFlight) return;
+  const roomId = app.currentRoom.id;
+  actionInFlight = true;
+  try {
+    const res = await apiPost(`/api/game/${roomId}/action`, {
+      playerId: app.player.id, action, payload
+    });
+    if (app.currentRoom?.id !== roomId) return;
+    if (!res.ok) {
+      SFX.alert();
+      showToast(res.error || 'Aksi kartu tidak valid!', 'error');
+      if (/berubah|Sinkronkan|giliran habis/i.test(res.error || '')) await triggerImmediateGameSync();
+      return;
+    }
+    app.selectedCardIds.clear();
+    applyGameSnapshot(res);
+  } finally {
+    actionInFlight = false;
   }
-
-  app.selectedCardIds.clear();
-  app.game = res.game;
-  if (res.version) app.gameVersion = res.version;
-  if (res.mySeat !== undefined && res.mySeat !== -1) app.mySeat = res.mySeat;
-  renderGameTable();
 }
 
 async function deleteCurrentRoom() {
