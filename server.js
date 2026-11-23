@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { query } = require('./lib/db');
 const { initGame, processGameAction, sanitizeGameStateForPlayer } = require('./lib/engine/games');
 const { getBotDecision } = require('./lib/engine/bots');
+const { generateMoveCommentary, generateChatReply } = require('./lib/agnes');
 
 const app = express();
 app.use(cors());
@@ -44,6 +45,86 @@ async function recordRoomEvent(roomId, eventType, payload) {
   } catch (err) {
     console.error('Failed to log room event:', err);
     return null;
+  }
+}
+
+// Agnes AI Chat & Move Commentary Handlers
+const lastBotChatAt = new Map();
+const lastMoveCommentAt = new Map();
+
+async function triggerBotChatReplyIfNeeded(roomId, senderName, userMessage) {
+  try {
+    const now = Date.now();
+    const lastAt = lastBotChatAt.get(roomId) || 0;
+    if (now - lastAt < 3500) return; // Debounce 3.5s
+
+    const botSeats = await query(`
+      SELECT rp.seat, rp.player_id, rp.bot_profile
+      FROM room_players rp
+      WHERE rp.room_id = $1 AND rp.is_bot = TRUE
+      ORDER BY rp.seat ASC
+    `, [roomId]);
+
+    if (botSeats.rows.length === 0) return;
+
+    // Prioritize Agnes AI if present, else pick first bot
+    const selectedBot = botSeats.rows.find(b => {
+      const p = b.bot_profile || {};
+      return p.isAgnes || (p.name && p.name.includes('Agnes'));
+    }) || botSeats.rows[0];
+
+    const profile = selectedBot.bot_profile || { name: 'Agnes AI', avatar: '🦊' };
+    const botName = profile.name || 'Agnes AI';
+    const botAvatar = profile.avatar || '🦊';
+
+    let gameContext = '';
+    const gRow = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
+    if (gRow.rows.length > 0 && gRow.rows[0].state) {
+      const g = gRow.rows[0].state;
+      gameContext = `Mode: ${g.mode}, Status: ${g.status || ''}`;
+    }
+
+    lastBotChatAt.set(roomId, now);
+
+    const reply = await generateChatReply(botName, senderName, userMessage, gameContext);
+    if (!reply) return;
+
+    await recordRoomEvent(roomId, 'CHAT', {
+      playerId: selectedBot.player_id,
+      sender: botName,
+      avatar: botAvatar,
+      message: reply,
+      seat: selectedBot.seat
+    });
+  } catch (err) {
+    console.warn('[Agnes Chat Error]', err.message);
+  }
+}
+
+async function triggerBotMoveReaction(roomId, botPlayer, mode, action, comboLabel, isFinished) {
+  try {
+    const now = Date.now();
+    const lastAt = lastMoveCommentAt.get(roomId) || 0;
+    if (!isFinished && now - lastAt < 5000) return; // Debounce 5s between move comments
+
+    const isAgnes = botPlayer.name && botPlayer.name.includes('Agnes');
+    const chance = isFinished ? 1.0 : (isAgnes ? 0.7 : 0.35);
+    if (Math.random() > chance) return;
+
+    lastMoveCommentAt.set(roomId, now);
+
+    const comment = await generateMoveCommentary(botPlayer.name, mode, action, comboLabel, isFinished);
+    if (!comment) return;
+
+    await recordRoomEvent(roomId, 'CHAT', {
+      playerId: botPlayer.playerId || `bot_${botPlayer.id}`,
+      sender: botPlayer.name,
+      avatar: botPlayer.avatar || '🦊',
+      message: comment,
+      seat: botPlayer.id
+    });
+  } catch (err) {
+    console.warn('[Agnes Move Reaction Error]', err.message);
   }
 }
 
@@ -110,6 +191,10 @@ async function runBotTurnsIfNeeded(roomId, g, force = false) {
     winnerText: g.winnerText,
     mode: g.mode
   });
+
+  if (decision) {
+    triggerBotMoveReaction(roomId, currentPl, g.mode, decision.action, g.lastAction?.text, g.finished);
+  }
 
   if (g.finished) {
     await handleGameOver(roomId, g);
@@ -725,8 +810,9 @@ app.post('/api/rooms/:id/ready', async (req, res) => {
   }
 });
 
-// 10. Fill Empty Seats with Bots
+// 10. Fill Empty Seats with Bots (Powered by Agnes AI)
 const BOT_PROFILES = [
+  { name: 'Agnes AI', avatar: '🦊', frame: 'border-amber-400', isAgnes: true },
   { name: 'Raka AI', avatar: '🐯', frame: 'border-cyan-400' },
   { name: 'Nadia AI', avatar: '🐼', frame: 'border-rose-400' },
   { name: 'Bima AI', avatar: '🤖', frame: 'border-emerald-400' },
@@ -1062,6 +1148,9 @@ app.post('/api/events/:roomId/chat', async (req, res) => {
     });
 
     res.json({ ok: true });
+
+    // Trigger Agnes AI / Bot conversational reply asynchronously
+    triggerBotChatReplyIfNeeded(roomId, p.name, message.trim());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
