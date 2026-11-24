@@ -620,15 +620,16 @@ function syncCurrentRoom() {
 
 function startHeartbeatSync() {
   if (app.syncTimer) clearInterval(app.syncTimer);
-  let lobbyTicks = 0;
+  let ticks = 0;
   app.syncTimer = setInterval(() => {
     if (document.visibilityState === 'hidden') return;
+    ticks++;
     if (app.view === 'lobby') {
-      if (++lobbyTicks % 5 === 0) refreshRoomsList();
-    } else {
+      if (ticks % 12 === 0) refreshRoomsList();
+    } else if (app.view === 'game' || ticks % 2 === 0) {
       syncCurrentRoom();
     }
-  }, 1800);
+  }, 750);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') syncCurrentRoom();
   });
@@ -1183,8 +1184,11 @@ function renderGameTable() {
         if (g.mode === 'capsa' || g.mode === 'bohong') {
           if (app.selectedCardIds.has(id)) app.selectedCardIds.delete(id);
           else app.selectedCardIds.add(id);
+          el.classList.toggle('selected', app.selectedCardIds.has(id));
+          const isCapsa = g.mode === 'capsa';
+          const playButton = document.getElementById(isCapsa ? 'act-capsa-play' : 'act-bohong-play');
+          playButton.textContent = `${isCapsa ? 'Keluarkan' : 'Taruh Tertutup'} (${app.selectedCardIds.size})`;
           SFX.card();
-          renderGameTable();
         } else if (g.mode === 'sevenup') {
           submitGameAction('play', { cardId: id });
         } else if (g.mode === 'empatsatu' && g.phase === 'discard') {
