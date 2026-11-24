@@ -235,7 +235,7 @@
             <button id="btn-mode-rules" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 transition">
               <span>❓</span> Aturan
             </button>
-            <button id="btn-restart-round" class="px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 text-xs font-semibold flex items-center gap-1 border border-emerald-500/30 transition">
+            <button id="btn-restart-round" class="hidden px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 text-xs font-semibold items-center gap-1 border border-emerald-500/30 transition">
               <span>🔄</span> Ronde Baru
             </button>
             <button id="btn-game-lobby" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 border border-slate-700 transition" title="Kembali ke Lobby (Meja tetap berjalan)">
@@ -294,7 +294,7 @@
         <!-- PLAYER HAND + IN-GAME CHAT & EMOTE STRIP -->
         <div class="bg-slate-900/95 pixel-box p-3 space-y-2.5">
           <!-- Hand cards -->
-          <div id="player-hand" class="flex items-end justify-start sm:justify-center gap-1.5 overflow-x-auto pb-1 pt-4 min-h-[112px]">
+          <div id="player-hand" class="flex items-end justify-start sm:[justify-content:safe_center] gap-1.5 overflow-x-auto pb-1 pt-4 min-h-[112px]">
             <!-- Cards rendered by JS -->
           </div>
 
@@ -457,9 +457,12 @@
         <div>
           <label class="block text-slate-400 font-bold mb-1">Jumlah Maksimal Kursi</label>
           <select id="cr-max" class="w-full bg-slate-950 border-2 border-slate-700 focus:border-amber-400 outline-none px-3 py-2 text-white">
+            <option value="2">2 Pemain</option>
+            <option value="3">3 Pemain</option>
             <option value="4" selected>4 Pemain</option>
             <option value="5">5 Pemain</option>
             <option value="6">6 Pemain</option>
+            <option value="7">7 Pemain</option>
             <option value="7">7 Pemain</option>
             <option value="8">8 Pemain</option>
           </select>
@@ -497,7 +500,7 @@
       <form id="form-join-password" class="space-y-3">
         <input id="jp-input" type="password" placeholder="Password ruangan..." maxlength="30" required
           class="w-full bg-slate-950 border-2 border-amber-400 outline-none px-3 py-2 text-xs text-white" />
-        <div id="jp-error" class="hidden text-rose-400 text-xs font-bold">Password salah! Coba lagi.</div>
+        <div id="jp-error" role="alert" class="hidden text-rose-400 text-xs font-bold"></div>
         <div class="flex justify-end gap-2">
           <button type="button" data-close-modal="modal-join-password" class="px-3 py-1.5 bg-slate-800 text-slate-300 text-xs font-bold">Batal</button>
           <button type="submit" class="px-4 py-1.5 bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold text-xs border-2 border-black">Masuk</button>
@@ -577,6 +580,6 @@
   <div id="toast-container" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 pointer-events-none"></div>
 
   <!-- CLIENT JAVASCRIPT -->
-  <script src="/js/app.js?v=ai-move-20261123"></script>
+  <script src="/js/app.js?v=multiplayer-20261124"></script>
 </body>
 </html>

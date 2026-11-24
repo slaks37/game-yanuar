@@ -1,5 +1,6 @@
 require('dotenv').config();
 const app = require("../server.js");
+const { pool } = require("../lib/db");
 
 const server = app.listen(0, async () => {
   const port = server.address().port;
@@ -36,7 +37,8 @@ const server = app.listen(0, async () => {
 
     // 2. Fill with Bots
     console.log("2. Filling empty seats with bots (Agnes AI)...");
-    await post(`/api/rooms/${roomId}/fill-bots`, {});
+    const fill = await post(`/api/rooms/${roomId}/fill-bots`, { hostId: p1Id });
+    if (!fill.data.ok) throw new Error(fill.data.error || "Failed to fill bot seats");
 
     const roomSync = await get(`/api/rooms/${roomId}/sync?since=0`);
     const agnesPlayer = roomSync.data.players.find(p => p.name === 'Agnes AI');
@@ -45,10 +47,11 @@ const server = app.listen(0, async () => {
 
     // 3. Send chat message to Agnes AI
     console.log("3. Sending chat message: 'Halo Agnes, kamu siap kalah hari ini?'...");
-    await post(`/api/events/${roomId}/chat`, {
+    const chat = await post(`/api/events/${roomId}/chat`, {
       playerId: p1Id,
       message: "Halo Agnes, kamu siap kalah hari ini?"
     });
+    if (!chat.data.ok) throw new Error(chat.data.error || "Chat send failed");
 
     console.log("Waiting 2.5 seconds for Agnes AI LLM completion...");
     await new Promise(r => setTimeout(r, 2500));
@@ -70,14 +73,15 @@ const server = app.listen(0, async () => {
 
     // 5. Start Game
     console.log("\n4. Starting game...");
-    await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
+    const start = await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
+    if (!start.data.ok) throw new Error(start.data.error || "Failed to start game");
 
     console.log("\n>>> AGNES AI INTEGRATION TEST COMPLETED SUCCESSFULLY! <<<");
   } catch (err) {
     console.error("Test failed:", err);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     server.close();
-    process.exit(0);
+    await pool.end();
   }
 });

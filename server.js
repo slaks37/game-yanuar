@@ -3,14 +3,62 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const crypto = require('crypto');
-const { query } = require('./lib/db');
-const { initGame, processGameAction, sanitizeGameStateForPlayer } = require('./lib/engine/games');
+const { waitUntil } = require('@vercel/functions');
+const { query, transaction } = require('./lib/db');
+const { initGame, repairCapsaOpening, prepareGoFishTurn, processGameAction, sanitizeGameStateForPlayer } = require('./lib/engine/games');
 const { getBotDecision } = require('./lib/engine/bots');
 const { generateMoveCommentary, generateChatReply } = require('./lib/agnes');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
+const GAME_MODES = new Set(['capsa', 'setan', 'sevenup', 'gofish', 'bohong', 'empatsatu', 'minuman', 'blackjack']);
+const ROOM_FIELDS = 'id, code, name, host_id, mode, max_players, is_private, status';
+
+class RoomError extends Error {
+  constructor(status, message, code) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function roomError(res, err) {
+  if (err instanceof RoomError) return res.status(err.status).json({ error: err.message, code: err.code });
+  console.error('Room operation failed:', err);
+  return res.status(500).json({ error: 'Operasi ruangan gagal. Silakan coba lagi.' });
+}
+
+function publicRoom({ id, code, name, host_id, mode, max_players, is_private, status }) {
+  return { id, code, name, host_id, mode, max_players, is_private, status };
+}
+
+async function changeRoom(roomIdent, change) {
+  const events = [];
+  const result = await transaction(async sql => {
+    const { rows: [room] } = await sql(
+      'SELECT * FROM rooms WHERE id = $1 OR code = UPPER($1) FOR UPDATE', [roomIdent]
+    );
+    if (!room) throw new RoomError(404, 'Ruangan tidak ditemukan');
+    async function emit(type, payload) {
+      const id = await insertRoomEvent(sql, room.id, type, payload);
+      events.push({ roomId: room.id, id, type, payload });
+    }
+    return change(room, sql, emit);
+  });
+  for (const { roomId, ...event } of events) publishRoomEvent(roomId, event);
+  return result;
+}
+
+function ensureHost(room, playerId) {
+  if (room.host_id !== playerId) throw new RoomError(403, 'Aksi ini hanya bisa dilakukan host.');
+}
+
 
 // Password hashing helper
 function hashPassword(password) {
@@ -21,30 +69,33 @@ function hashPassword(password) {
 // In-memory SSE clients per instance (for instant pushes when on same container)
 const sseClients = new Map(); // roomId -> Set(res)
 
-async function recordRoomEvent(roomId, eventType, payload) {
-  try {
-    const res = await query(
-      'INSERT INTO room_events (room_id, event_type, payload) VALUES ($1, $2, $3) RETURNING id, created_at',
-      [roomId, eventType, JSON.stringify(payload)]
-    );
-    const eventId = res.rows[0]?.id;
+async function insertRoomEvent(sql, roomId, type, payload) {
+  const { rows: [event] } = await sql(
+    'INSERT INTO room_events (room_id, event_type, payload) VALUES ($1, $2, $3) RETURNING id',
+    [roomId, type, JSON.stringify(payload)]
+  );
+  return event.id;
+}
 
-    // Push to local SSE clients if any
-    const clients = sseClients.get(roomId);
-    if (clients && clients.size > 0) {
-      const data = `data: ${JSON.stringify({ id: eventId, type: eventType, payload, timestamp: Date.now() })}\n\n`;
-      for (const client of clients) {
-        try {
-          client.write(data);
-        } catch (e) {
-          clients.delete(client);
-        }
-      }
+function publishRoomEvent(roomId, event) {
+  const clients = sseClients.get(roomId);
+  if (!clients?.size) return;
+  const data = `data: ${JSON.stringify({ ...event, timestamp: Date.now() })}\n\n`;
+  for (const client of clients) {
+    try {
+      client.write(data);
+    } catch {
+      clients.delete(client);
     }
-    return eventId;
+  }
+}
+
+async function recordRoomEvent(roomId, type, payload) {
+  try {
+    await changeRoom(roomId, (_room, _sql, emit) => emit(type, payload));
   } catch (err) {
+    if (err instanceof RoomError && err.status === 404) return;
     console.error('Failed to log room event:', err);
-    return null;
   }
 }
 
@@ -78,9 +129,12 @@ async function triggerBotChatReplyIfNeeded(roomId, senderName, userMessage) {
     const botAvatar = profile.avatar || '🦊';
 
     let gameContext = '';
+    let seat = selectedBot.seat;
     const gRow = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
     if (gRow.rows.length > 0 && gRow.rows[0].state) {
       const g = gRow.rows[0].state;
+      const gameSeat = g.players.findIndex(p => p.playerId === selectedBot.player_id);
+      if (gameSeat >= 0) seat = gameSeat;
       gameContext = `Mode: ${g.mode}, Status: ${g.status || ''}`;
     }
 
@@ -94,7 +148,7 @@ async function triggerBotChatReplyIfNeeded(roomId, senderName, userMessage) {
       sender: botName,
       avatar: botAvatar,
       message: reply,
-      seat: selectedBot.seat
+      seat
     });
   } catch (err) {
     console.warn('[Agnes Chat Error]', err.message);
@@ -192,111 +246,115 @@ async function runBotTurnsIfNeeded(roomId, g, expectedVersion) {
     }
   }
   const move = publicBotMove(g, bot, shown, handBefore);
-  const saved = await query(
-    'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
-    [JSON.stringify(g), roomId, expectedVersion]
-  );
-  if (!saved.rows.length) {
-    const latest = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
-    return latest.rows.length ? { game: latest.rows[0].state, version: latest.rows[0].version } : unchanged();
+  const saved = await persistMove(roomId, g, expectedVersion, shown?.action || 'pass', move);
+  if (!saved) return readStoredGame(roomId);
+  if (shown && process.env.AGNES_API_KEY) {
+    waitUntil(triggerBotMoveReaction(roomId, bot, g.mode, shown.action, move.text, g.finished));
   }
-  const version = saved.rows[0].version;
-  await recordRoomEvent(roomId, 'GAME_UPDATE', {
-    action: shown?.action || 'pass', status: g.status, turn: g.turn, finished: g.finished,
-    winnerText: g.winnerText, mode: g.mode, version, move
-  });
-  if (shown) void triggerBotMoveReaction(roomId, bot, g.mode, shown.action, move.text, g.finished);
-  if (g.finished) await handleGameOver(roomId, g);
-  return { game: g, version };
+  return saved;
 }
 
 // Check and enforce 60s max turn timer (Auto Pass / Move if player AFK)
-async function checkAndApplyTurnTimeout(roomId, g, expectedVersion) {
-  if (!g || g.finished || !g.turnStartedAt) return g;
-  const elapsed = Date.now() - g.turnStartedAt;
-  const limit = (g.turnTimeLimitSec || 60) * 1000;
-
-  if (elapsed >= limit) {
-    const timedOutPlayer = g.players[g.turn];
-    if (!timedOutPlayer || timedOutPlayer.isBot || String(timedOutPlayer.playerId || '').startsWith('bot_')) return g;
-
-    // Use AI decision fallback to execute optimal pass/play for timed out player
-    const decision = getBotDecision(g, g.turn);
-    if (decision) {
-      const res = processGameAction(g, g.turn, decision.action, decision.payload);
-      if (res.ok) {
-        g.turnStartedAt = Date.now();
-        g.status = `⏱️ Waktu habis (1 mnt)! ${timedOutPlayer.name} otomatis Pass/Jalan. ${g.status || ''}`;
-
-        const saved = await query(
-          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
-          [JSON.stringify(g), roomId, expectedVersion]
-        );
-        if (!saved.rows.length) {
-          const latest = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
-          return latest.rows[0]?.state || g;
-        }
-
-        await recordRoomEvent(roomId, 'GAME_UPDATE', {
-          action: 'TIMEOUT_AUTO',
-          status: g.status,
-          turn: g.turn,
-          finished: g.finished,
-          winnerText: g.winnerText
-        });
-
-        if (g.finished) {
-          await handleGameOver(roomId, g);
-        }
-      }
-    }
+async function checkAndApplyTurnTimeout(roomId, snapshot) {
+  const { game, version } = snapshot;
+  if (game.finished || !game.turnStartedAt || Date.now() - game.turnStartedAt < (game.turnTimeLimitSec || 60) * 1000) {
+    return snapshot;
   }
-  return g;
+  const timedOutPlayer = game.players[game.turn];
+  if (!timedOutPlayer || timedOutPlayer.isBot || String(timedOutPlayer.playerId || '').startsWith('bot_')) return snapshot;
+
+  const decision = getBotDecision(game, game.turn);
+  if (!decision || !processGameAction(game, game.turn, decision.action, decision.payload).ok) return snapshot;
+
+  game.status = `⏱️ Waktu habis! ${timedOutPlayer.name} otomatis Pass/Jalan. ${game.status || ''}`;
+  return await persistMove(roomId, game, version, 'TIMEOUT_AUTO') || await readStoredGame(roomId);
 }
 
-async function handleGameOver(roomId, g) {
-  try {
-    await query("UPDATE rooms SET status = 'finished', updated_at = NOW() WHERE id = $1", [roomId]);
+async function persistMove(roomId, game, expectedVersion, action, move) {
+  return changeRoom(roomId, async (room, sql, emit) => {
+    if (room.status !== 'playing') return null;
+    const { rows: [saved] } = await sql(
+      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
+      [JSON.stringify(game), room.id, expectedVersion]
+    );
+    if (!saved) return null;
 
-    if (g.winnerIdx !== null && g.winnerIdx !== undefined) {
-      const winner = g.players[g.winnerIdx];
-      if (winner && !winner.isBot) {
-        await query(
-          `UPDATE players
-           SET coins = coins + 500,
-               highscore = GREATEST(COALESCE(highscore, 0), coins + 500),
-               wins = wins + 1,
-               matches = matches + 1,
-               last_active_at = NOW()
-           WHERE id = $1`,
-          [winner.playerId]
-        );
-      }
-    }
-
-    // Award match count to all human participants
-    for (const p of g.players) {
-      if (!p.isBot && (g.winnerIdx === null || p.id !== g.winnerIdx)) {
-        await query(
-          `UPDATE players
-           SET coins = coins + 50,
-               highscore = GREATEST(COALESCE(highscore, 0), coins + 50),
-               matches = matches + 1,
-               last_active_at = NOW()
-           WHERE id = $1`,
-          [p.playerId]
-        );
-      }
-    }
-
-    await recordRoomEvent(roomId, 'GAME_OVER', {
-      winnerIdx: g.winnerIdx,
-      winnerText: g.winnerText,
-      status: g.status
+    await sql('UPDATE rooms SET status = $2, updated_at = NOW() WHERE id = $1',
+      [room.id, game.finished ? 'finished' : 'playing']);
+    await emit('GAME_UPDATE', {
+      action, move, mode: game.mode, status: game.status, turn: game.turn, finished: game.finished,
+      winnerText: game.winnerText, version: saved.version
     });
-  } catch (err) {
-    console.error('Failed to handle game over:', err);
+    if (game.finished) await handleGameOver(game, sql, emit);
+    return { game, version: saved.version };
+  });
+}
+
+async function handleGameOver(game, sql, emit) {
+  const humans = game.players.filter(p => !p.isBot);
+  await sql('SELECT id FROM players WHERE id = ANY($1) ORDER BY id FOR UPDATE', [humans.map(p => p.playerId)]);
+  const winner = humans.find(p => p.id === game.winnerIdx);
+  const losers = humans.filter(p => p !== winner).map(p => p.playerId);
+  // Keep the score and the winning move in the same transaction.
+  await sql(
+    `UPDATE players
+     SET coins = coins + 50, highscore = GREATEST(COALESCE(highscore, 0), coins + 50),
+         matches = matches + 1, last_active_at = NOW()
+     WHERE id = ANY($1)`,
+    [losers]
+  );
+  if (winner) {
+    await sql(
+      `UPDATE players
+       SET coins = coins + 500, highscore = GREATEST(COALESCE(highscore, 0), coins + 500),
+           wins = wins + 1, matches = matches + 1, last_active_at = NOW()
+       WHERE id = $1`,
+      [winner.playerId]
+    );
   }
+  await emit('GAME_OVER', { winnerIdx: game.winnerIdx, winnerText: game.winnerText, status: game.status });
+}
+
+async function readStoredGame(roomId) {
+  const { rows: [row] } = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
+  if (!row) throw new RoomError(404, 'Permainan tidak ditemukan');
+  return { game: row.state, version: row.version };
+}
+
+function gameSeat(game, playerId) {
+  const seat = game.players.findIndex(p => p.playerId === playerId && !p.isBot);
+  if (seat < 0) throw new RoomError(403, 'Pemain belum bergabung di meja ini.', 'ROOM_MEMBERSHIP_REQUIRED');
+  return seat;
+}
+
+async function loadGame(roomId, playerId) {
+  const snapshot = await readStoredGame(roomId);
+  const { game, version } = snapshot;
+  gameSeat(game, playerId);
+  if (game.finished) return snapshot;
+
+  const requiredOpening = game.mustInclude3D;
+  repairCapsaOpening(game);
+  let repaired = requiredOpening !== game.mustInclude3D;
+  if (game.mode === 'gofish') {
+    const { turn } = game;
+    const stockCount = game.deck.length;
+    prepareGoFishTurn(game);
+    repaired = game.finished || game.turn !== turn || game.deck.length !== stockCount;
+  }
+  if (!repaired) return snapshot;
+  return await persistMove(roomId, game, version, 'RESUME') || await readStoredGame(roomId);
+}
+
+function gameResponse({ game, version }, playerId, clientVersion) {
+  const mySeat = gameSeat(game, playerId);
+  return {
+    ok: true,
+    game: version !== clientVersion ? sanitizeGameStateForPlayer(game, mySeat) : null,
+    mySeat,
+    version,
+    serverTime: Date.now(),
+  };
 }
 
 // ================= API ROUTES =================
@@ -408,33 +466,20 @@ app.post('/api/player/rename', async (req, res) => {
 
     const updatedPlayer = update.rows[0];
 
-    // Update any active game state where this player is seated
-    const activeGames = await query(
-      `SELECT gs.room_id, gs.state, gs.version
-       FROM game_states gs
-       JOIN room_players rp ON gs.room_id = rp.room_id
-       WHERE rp.player_id = $1`,
-      [id]
-    );
-
-    for (const gRow of activeGames.rows) {
-      const gState = gRow.state;
-      let stateChanged = false;
-      if (gState && gState.players) {
-        for (const pl of gState.players) {
-          if (pl.playerId === id) {
-            pl.name = cleanName;
-            stateChanged = true;
-          }
-        }
-      }
-      if (stateChanged) {
-        await query(
-          'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-          [JSON.stringify(gState), gRow.room_id]
-        );
-      }
-    }
+    await query(`
+      UPDATE game_states gs
+      SET state = jsonb_set(gs.state, '{players}', (
+        SELECT jsonb_agg(
+          CASE WHEN player->>'playerId' = $1 THEN jsonb_set(player, '{name}', to_jsonb($2::text))
+               ELSE player END
+          ORDER BY seat
+        )
+        FROM jsonb_array_elements(gs.state->'players') WITH ORDINALITY AS seated(player, seat)
+      )),
+      version = gs.version + 1,
+      updated_at = NOW()
+      WHERE EXISTS (SELECT 1 FROM room_players rp WHERE rp.room_id = gs.room_id AND rp.player_id = $1)
+    `, [id, cleanName]);
 
     // Broadcast to any room player is in
     const roomsSeated = await query('SELECT DISTINCT room_id, seat FROM room_players WHERE player_id = $1', [id]);
@@ -454,34 +499,21 @@ app.post('/api/player/sync', async (req, res) => {
     const { id, name, avatar, frame, skin, tableSkin } = req.body;
     if (!id) return res.status(400).json({ error: 'Missing id' });
 
-    const existing = await query('SELECT * FROM players WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      const insert = await query(
-        `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 2500, 2500, 0, 0, NOW())
-         RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
-        [id, name || 'Pemain', avatar || '🦊', frame || 'border-amber-400', skin || 'skin-royal', tableSkin || 'table-emerald']
-      );
-      return res.json({ ok: true, player: insert.rows[0] });
-    }
-
-    // Preserve saved name in database so it is never overwritten by default guest name
-    const authoritativeName = existing.rows[0].name || name;
-
-    const update = await query(
-      `UPDATE players
-       SET name = $2,
-           avatar = $3,
-           frame = $4,
-           skin = $5,
-           table_skin = $6,
-           highscore = GREATEST(COALESCE(highscore, 0), coins),
+    const { rows: [player] } = await query(
+      `INSERT INTO players (id, name, avatar, frame, skin, table_skin)
+       VALUES ($1, $2, COALESCE($3, '🦊'), COALESCE($4, 'border-amber-400'),
+               COALESCE($5, 'skin-royal'), COALESCE($6, 'table-emerald'))
+       ON CONFLICT (id) DO UPDATE
+       SET avatar = COALESCE($3, players.avatar),
+           frame = COALESCE($4, players.frame),
+           skin = COALESCE($5, players.skin),
+           table_skin = COALESCE($6, players.table_skin),
+           highscore = GREATEST(COALESCE(players.highscore, 0), players.coins),
            last_active_at = NOW()
-       WHERE id = $1
        RETURNING id, username, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches`,
-      [id, authoritativeName, avatar || existing.rows[0].avatar, frame || existing.rows[0].frame, skin || existing.rows[0].skin, tableSkin || existing.rows[0].table_skin]
+      [id, name || 'Pemain', avatar || null, frame || null, skin || null, tableSkin || null]
     );
-    res.json({ ok: true, player: update.rows[0] });
+    res.json({ ok: true, player });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -505,10 +537,13 @@ app.get('/api/leaderboard', async (req, res) => {
 // 4. List open rooms (with 7-minute inactivity auto-cleanup)
 app.get('/api/rooms', async (req, res) => {
   try {
-    // Automatically purge inactive rooms older than 7 minutes (420 seconds) with no activity
     await query(`
-      DELETE FROM rooms
-      WHERE updated_at < NOW() - INTERVAL '7 minutes'
+      WITH expired AS (
+        DELETE FROM rooms
+        WHERE updated_at < NOW() - INTERVAL '7 minutes'
+        RETURNING id
+      )
+      DELETE FROM room_events WHERE room_id IN (SELECT id FROM expired)
     `);
 
     const rooms = await query(`
@@ -531,291 +566,192 @@ app.get('/api/rooms', async (req, res) => {
 // 5. Create Room
 app.post('/api/rooms', async (req, res) => {
   try {
-    const { name, mode, maxPlayers, password, isPrivate, hostId } = req.body;
-    if (!name || !mode || !hostId) return res.status(400).json({ error: 'Data ruangan tidak lengkap' });
+    const { name, mode, maxPlayers = 4, password = '', isPrivate, hostId } = req.body;
+    const roomName = typeof name === 'string' ? name.trim() : '';
+    if (!roomName || roomName.length > 64 || !GAME_MODES.has(mode) ||
+        !Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 8 ||
+        typeof hostId !== 'string' || !hostId || hostId.length > 64) {
+      throw new RoomError(400, 'Nama, mode, host, atau jumlah pemain tidak valid.');
+    }
+    if (isPrivate && (typeof password !== 'string' || !password || password.length > 64)) {
+      throw new RoomError(400, 'Masukkan password ruangan dengan maksimal 64 karakter.');
+    }
 
-    const code = 'KRT-' + Math.floor(1000 + Math.random() * 9000);
-    const roomId = 'room_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const room = await transaction(async sql => {
+      const roomId = `room_${crypto.randomUUID()}`;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const code = `KRT-${crypto.randomInt(1000, 10000)}`;
+        const { rows: [created] } = await sql(
+          `INSERT INTO rooms (id, code, name, host_id, mode, max_players, password, is_private, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'waiting')
+           ON CONFLICT (code) DO NOTHING
+           RETURNING ${ROOM_FIELDS}`,
+          [roomId, code, roomName, hostId, mode, maxPlayers, isPrivate ? password : '', !!isPrivate]
+        );
+        if (!created) continue;
 
-    await query(
-      `INSERT INTO rooms (id, code, name, host_id, mode, max_players, password, is_private, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'waiting')`,
-      [roomId, code, name, hostId, mode, maxPlayers || 4, password || '', !!isPrivate]
-    );
-
-    // Host sits at seat 0
-    await query(
-      `INSERT INTO room_players (room_id, player_id, seat, is_ready, is_host, is_bot)
-       VALUES ($1, $2, 0, TRUE, TRUE, FALSE)`,
-      [roomId, hostId]
-    );
-
-    res.json({
-      ok: true,
-      room: { id: roomId, code, name, mode, max_players: maxPlayers || 4, is_private: !!isPrivate, status: 'waiting' }
+        await sql(
+          `INSERT INTO room_players (room_id, player_id, seat, is_ready, is_host, is_bot)
+           VALUES ($1, $2, 0, TRUE, TRUE, FALSE)`,
+          [roomId, hostId]
+        );
+        return created;
+      }
+      throw new RoomError(503, 'Kode ruangan belum tersedia. Silakan coba lagi.');
     });
+
+    res.json({ ok: true, room });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
-// 6. Get Room Details & Seated Players
+async function readRoom(roomIdent) {
+  const { rows: [room] } = await query(
+    `SELECT ${ROOM_FIELDS} FROM rooms WHERE id = $1 OR code = UPPER($1)`, [roomIdent]
+  );
+  if (!room) throw new RoomError(404, 'Ruangan tidak ditemukan');
+  return room;
+}
+
+async function readRoomPlayers(room, playerId) {
+  const { rows: players } = await query(`
+    SELECT rp.seat, rp.is_ready, rp.is_host, rp.is_bot,
+           rp.player_id AS id,
+           COALESCE(p.name, rp.bot_profile->>'name', 'Pemain') AS name,
+           COALESCE(p.avatar, rp.bot_profile->>'avatar', '🦊') AS avatar,
+           COALESCE(p.frame, rp.bot_profile->>'frame', 'border-amber-400') AS frame,
+           COALESCE(p.skin, 'skin-royal') AS skin,
+           COALESCE(p.table_skin, 'table-emerald') AS table_skin
+    FROM room_players rp
+    LEFT JOIN players p ON rp.player_id = p.id
+    WHERE rp.room_id = $1
+    ORDER BY rp.seat
+  `, [room.id]);
+  if (room.is_private && !players.some(player => player.id === playerId && !player.is_bot)) {
+    throw new RoomError(403, 'Pemain belum bergabung di ruangan ini.', 'ROOM_MEMBERSHIP_REQUIRED');
+  }
+  return players;
+}
+
+async function eventsSince(roomId, since = '0') {
+  const cursor = typeof since === 'string' && /^[0-9]{1,18}$/.test(since) ? since : '0';
+  const { rows: events } = await query(
+    'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id LIMIT 50',
+    [roomId, cursor]
+  );
+  return { events, latestEventId: events.at(-1)?.id ?? cursor };
+}
+
+// Room details remain available by either invite code or room ID.
 app.get('/api/rooms/:id', async (req, res) => {
   try {
-    const roomId = req.params.id;
-    const roomRes = await query('SELECT * FROM rooms WHERE id = $1 OR code = $1', [roomId]);
-    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Ruangan tidak ditemukan' });
-
-    const room = roomRes.rows[0];
-    const actualRoomId = room.id;
-
-    const playersRes = await query(`
-      SELECT rp.seat, rp.is_ready, rp.is_host, rp.is_bot, rp.bot_profile,
-             COALESCE(p.id, rp.player_id) as id,
-             COALESCE(p.name, rp.bot_profile->>'name') as name,
-             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar,
-             COALESCE(p.frame, rp.bot_profile->>'frame') as frame,
-             COALESCE(p.skin, 'skin-royal') as skin,
-             COALESCE(p.table_skin, 'table-emerald') as table_skin
-      FROM room_players rp
-      LEFT JOIN players p ON rp.player_id = p.id
-      WHERE rp.room_id = $1
-      ORDER BY rp.seat ASC
-    `, [actualRoomId]);
-
-    res.json({
-      ok: true,
-      room: {
-        id: room.id,
-        code: room.code,
-        name: room.name,
-        host_id: room.host_id,
-        mode: room.mode,
-        max_players: room.max_players,
-        is_private: room.is_private,
-        status: room.status
-      },
-      players: playersRes.rows
-    });
+    const room = await readRoom(req.params.id);
+    const players = await readRoomPlayers(room, req.query.playerId);
+    res.json({ ok: true, room, players });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
-// 6b. Room Lounge Sync (High-Frequency Poll for 100% reliable real-time lounge sync)
 app.get('/api/rooms/:id/sync', async (req, res) => {
   try {
-    const roomId = req.params.id;
-    const sinceEventId = Number(req.query.since || 0);
-
-    const roomRes = await query('SELECT id, code, name, host_id, mode, max_players, is_private, status FROM rooms WHERE id = $1 OR code = $1', [roomId]);
-    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Ruangan tidak ditemukan' });
-
-    const room = roomRes.rows[0];
-
-    const playersRes = await query(`
-      SELECT rp.seat, rp.is_ready, rp.is_host, rp.is_bot, rp.bot_profile,
-             COALESCE(p.id, rp.player_id) as id,
-             COALESCE(p.name, rp.bot_profile->>'name') as name,
-             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar,
-             COALESCE(p.frame, rp.bot_profile->>'frame') as frame,
-             COALESCE(p.skin, 'skin-royal') as skin,
-             COALESCE(p.table_skin, 'table-emerald') as table_skin
-      FROM room_players rp
-      LEFT JOIN players p ON rp.player_id = p.id
-      WHERE rp.room_id = $1
-      ORDER BY rp.seat ASC
-    `, [room.id]);
-
-    const eventsRes = await query(
-      'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
-      [room.id, sinceEventId]
-    );
-
-    const latestEventId = eventsRes.rows.length > 0 ? eventsRes.rows[eventsRes.rows.length - 1].id : sinceEventId;
-
-    res.json({
-      ok: true,
-      room,
-      players: playersRes.rows,
-      events: eventsRes.rows,
-      latestEventId
-    });
+    const room = await readRoom(req.params.id);
+    const players = await readRoomPlayers(room, req.query.playerId);
+    res.json({ ok: true, room, players, ...await eventsSince(room.id, req.query.since) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 7. Join Room / Reconnect to Room
 app.post('/api/rooms/:id/join', async (req, res) => {
   try {
-    const roomIdent = req.params.id;
     const { playerId, playerName, password } = req.body;
-    if (!playerId) return res.status(400).json({ error: 'Player ID required' });
-
-    const roomRes = await query('SELECT * FROM rooms WHERE id = $1 OR code = $1', [roomIdent]);
-    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Ruangan tidak ditemukan' });
-    const room = roomRes.rows[0];
-
-    if (room.is_private && room.password && room.password !== password) {
-      return res.status(403).json({ error: 'Password ruangan salah!' });
+    if (typeof playerId !== 'string' || !playerId || playerId.length > 64 || playerId.startsWith('bot_')) {
+      throw new RoomError(400, 'ID pemain tidak valid.');
     }
 
-    // Resolve player's effective name and profile
-    let effectiveName = playerName ? String(playerName).trim().slice(0, 24) : '';
-    const playerInfo = await query('SELECT id, name, avatar, frame FROM players WHERE id = $1', [playerId]);
-    if (playerInfo.rows.length > 0 && playerInfo.rows[0].name) {
-      effectiveName = playerInfo.rows[0].name.trim();
-    } else if (effectiveName) {
-      // Ensure player row exists in DB
-      await query(
-        `INSERT INTO players (id, name, avatar, frame, skin, table_skin, coins, highscore, wins, matches, last_active_at)
-         VALUES ($1, $2, '🦊', 'border-amber-400', 'skin-royal', 'table-emerald', 2500, 2500, 0, 0, NOW())
-         ON CONFLICT (id) DO UPDATE SET name = $2, last_active_at = NOW()`,
-        [playerId, effectiveName]
-      );
-    }
-
-    // Fetch all current seated players in this room
-    const currentSeatsRes = await query(`
-      SELECT rp.seat, rp.player_id, rp.is_ready, rp.is_host, rp.is_bot, rp.bot_profile,
-             COALESCE(p.name, rp.bot_profile->>'name') as name,
-             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar
-      FROM room_players rp
-      LEFT JOIN players p ON rp.player_id = p.id
-      WHERE rp.room_id = $1
-      ORDER BY rp.seat ASC
-    `, [room.id]);
-
-    // Check if player is already seated in this room:
-    // Match 1: By exact playerId
-    let matchedSeat = currentSeatsRes.rows.find(r => r.player_id === playerId);
-
-    // Match 2: By matching name (case-insensitive) if not already matched
-    if (!matchedSeat && effectiveName) {
-      matchedSeat = currentSeatsRes.rows.find(r =>
-        r.name && r.name.trim().toLowerCase() === effectiveName.toLowerCase()
-      );
-    }
-
-    // IF MATCHED: Player is reconnecting / reclaiming their existing seat!
-    if (matchedSeat) {
-      const targetSeat = matchedSeat.seat;
-
-      // If playerId changed (new tab / reconnected with same name), update room_players and game_states
-      if (matchedSeat.player_id !== playerId) {
-        await query(
-          'UPDATE room_players SET player_id = $1, is_bot = FALSE WHERE room_id = $2 AND seat = $3',
-          [playerId, room.id, targetSeat]
-        );
-
-        if (matchedSeat.is_host) {
-          await query('UPDATE rooms SET host_id = $1 WHERE id = $2', [playerId, room.id]);
-        }
-
-        // Also update playerId in active game_states if game is running
-        const gsRes = await query('SELECT state, version FROM game_states WHERE room_id = $1', [room.id]);
-        if (gsRes.rows.length > 0 && gsRes.rows[0].state) {
-          const g = gsRes.rows[0].state;
-          if (g.players && g.players[targetSeat]) {
-            g.players[targetSeat].playerId = playerId;
-            g.players[targetSeat].name = effectiveName || g.players[targetSeat].name;
-            g.players[targetSeat].isBot = false;
-            await query(
-              'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2',
-              [JSON.stringify(g), room.id]
-            );
-          }
-        }
+    const result = await changeRoom(req.params.id, async (room, sql, emit) => {
+      if (room.is_private && room.password && room.password !== password) {
+        throw new RoomError(403, 'Password ruangan salah!', 'ROOM_PASSWORD_REQUIRED');
+      }
+      const seats = await sql('SELECT seat, player_id FROM room_players WHERE room_id = $1', [room.id]);
+      const existing = seats.rows.find(p => p.player_id === playerId);
+      if (!existing && room.status !== 'waiting') {
+        throw new RoomError(409, 'Permainan di ruangan ini sudah dimulai atau selesai.');
+      }
+      if (!existing && seats.rows.length >= room.max_players) {
+        throw new RoomError(409, 'Ruangan sudah penuh.');
       }
 
-      await recordRoomEvent(room.id, 'PLAYER_JOINED', {
-        playerId,
-        name: effectiveName || matchedSeat.name,
-        seat: targetSeat,
-        reconnected: true
-      });
+      const displayName = (typeof playerName === 'string' && playerName.trim().slice(0, 24)) || 'Pemain';
+      await sql('INSERT INTO players (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
+        [playerId, displayName]);
+      await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+      if (existing) return { room: publicRoom(room), seat: existing.seat, reconnected: true };
 
-      return res.json({ ok: true, room, seat: targetSeat, reconnected: true });
-    }
-
-    // IF NOT MATCHED: New player joining.
-    // Cannot join new seat if game is already in progress
-    if (room.status !== 'waiting') {
-      return res.status(400).json({ error: 'Permainan di ruangan ini sudah dimulai atau selesai!' });
-    }
-
-    if (currentSeatsRes.rows.length >= room.max_players) {
-      return res.status(400).json({ error: 'Ruangan sudah penuh!' });
-    }
-
-    const taken = new Set(currentSeatsRes.rows.map(r => r.seat));
-    let targetSeat = -1;
-    for (let i = 0; i < room.max_players; i++) {
-      if (!taken.has(i)) {
-        targetSeat = i;
-        break;
-      }
-    }
-
-    await query(
-      `INSERT INTO room_players (room_id, player_id, seat, is_ready, is_host, is_bot)
-       VALUES ($1, $2, $3, FALSE, FALSE, FALSE)`,
-      [room.id, playerId, targetSeat]
-    );
-
-    const pName = effectiveName || 'Pemain';
-
-    await recordRoomEvent(room.id, 'PLAYER_JOINED', {
-      playerId,
-      name: pName,
-      seat: targetSeat
+      const taken = new Set(seats.rows.map(p => p.seat));
+      const seat = Array.from({ length: room.max_players }, (_, index) => index).find(index => !taken.has(index));
+      await sql('INSERT INTO room_players (room_id, player_id, seat) VALUES ($1, $2, $3)', [room.id, playerId, seat]);
+      const { rows: [player] } = await sql('SELECT name FROM players WHERE id = $1', [playerId]);
+      await emit('PLAYER_JOINED', { playerId, name: player.name, seat });
+      return { room: publicRoom(room), seat };
     });
-
-    res.json({ ok: true, room, seat: targetSeat });
+    res.json({ ok: true, ...result });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 8. Leave Room
 app.post('/api/rooms/:id/leave', async (req, res) => {
   try {
-    const roomId = req.params.id;
     const { playerId } = req.body;
-    await query('DELETE FROM room_players WHERE room_id = $1 AND player_id = $2', [roomId, playerId]);
+    await changeRoom(req.params.id, async (room, sql, emit) => {
+      // Keep seats for reconnects during a round.
+      if (room.status === 'playing') return;
+      const removed = await sql('DELETE FROM room_players WHERE room_id = $1 AND player_id = $2 AND NOT is_bot',
+        [room.id, playerId]);
+      if (!removed.rowCount) return;
 
-    // Check if any human players left
-    const remaining = await query('SELECT * FROM room_players WHERE room_id = $1 AND is_bot = FALSE', [roomId]);
-    if (remaining.rows.length === 0) {
-      await query('DELETE FROM rooms WHERE id = $1', [roomId]);
-    } else {
-      // Transfer host if host left
-      const room = (await query('SELECT host_id FROM rooms WHERE id = $1', [roomId])).rows[0];
-      if (room && room.host_id === playerId) {
-        const newHost = remaining.rows[0];
-        await query('UPDATE rooms SET host_id = $1 WHERE id = $2', [newHost.player_id, roomId]);
-        await query('UPDATE room_players SET is_host = TRUE WHERE room_id = $1 AND player_id = $2', [roomId, newHost.player_id]);
+      const { rows: [nextHost] } = await sql(
+        'SELECT player_id FROM room_players WHERE room_id = $1 AND NOT is_bot ORDER BY seat LIMIT 1', [room.id]
+      );
+      if (!nextHost) {
+        await sql('DELETE FROM rooms WHERE id = $1', [room.id]);
+        await sql('DELETE FROM room_events WHERE room_id = $1', [room.id]);
+        return;
       }
-      await recordRoomEvent(roomId, 'PLAYER_LEFT', { playerId });
-    }
-
+      if (room.host_id === playerId) {
+        await sql('UPDATE rooms SET host_id = $1 WHERE id = $2', [nextHost.player_id, room.id]);
+        await sql('UPDATE room_players SET is_host = TRUE WHERE room_id = $1 AND player_id = $2',
+          [room.id, nextHost.player_id]);
+      }
+      await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+      await emit('PLAYER_LEFT', { playerId });
+    });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 9. Ready toggle
 app.post('/api/rooms/:id/ready', async (req, res) => {
   try {
-    const roomId = req.params.id;
     const { playerId, isReady } = req.body;
-    await query('UPDATE room_players SET is_ready = $1 WHERE room_id = $2 AND player_id = $3', [!!isReady, roomId, playerId]);
-    await recordRoomEvent(roomId, 'PLAYER_READY', { playerId, isReady: !!isReady });
+    await changeRoom(req.params.id, async (room, sql, emit) => {
+      if (room.status !== 'waiting') throw new RoomError(409, 'Permainan sudah dimulai.');
+      const updated = await sql('UPDATE room_players SET is_ready = $1 WHERE room_id = $2 AND player_id = $3 AND NOT is_bot',
+        [!!isReady, room.id, playerId]);
+      if (!updated.rowCount) throw new RoomError(403, 'Pemain belum bergabung di ruangan ini.');
+      await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+      await emit('PLAYER_READY', { playerId, isReady: !!isReady });
+    });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
@@ -833,293 +769,168 @@ const BOT_PROFILES = [
 
 app.post('/api/rooms/:id/fill-bots', async (req, res) => {
   try {
-    const roomId = req.params.id;
-    const room = (await query('SELECT * FROM rooms WHERE id = $1', [roomId])).rows[0];
-    if (!room) return res.status(404).json({ error: 'Room not found' });
-
-    const current = (await query('SELECT seat FROM room_players WHERE room_id = $1', [roomId])).rows;
-    const taken = new Set(current.map(r => r.seat));
-
-    let botIdx = 0;
-    for (let s = 0; s < room.max_players; s++) {
-      if (!taken.has(s)) {
-        const b = BOT_PROFILES[botIdx % BOT_PROFILES.length];
-        botIdx++;
-        await query(
-          `INSERT INTO room_players (room_id, player_id, seat, is_ready, is_host, is_bot, bot_profile)
-           VALUES ($1, $2, $3, TRUE, FALSE, TRUE, $4)`,
-          [roomId, `bot_${s}_${Date.now()}`, s, JSON.stringify(b)]
+    await changeRoom(req.params.id, async (room, sql, emit) => {
+      ensureHost(room, req.body.hostId);
+      if (room.status !== 'waiting') throw new RoomError(409, 'Permainan sudah dimulai.');
+      const current = await sql('SELECT seat FROM room_players WHERE room_id = $1', [room.id]);
+      const taken = new Set(current.rows.map(r => r.seat));
+      let botIdx = 0;
+      for (let seat = 0; seat < room.max_players; seat++) {
+        if (taken.has(seat)) continue;
+        await sql(
+          `INSERT INTO room_players (room_id, player_id, seat, is_ready, is_bot, bot_profile)
+           VALUES ($1, $2, $3, TRUE, TRUE, $4)`,
+          [room.id, `bot_${crypto.randomUUID()}`, seat, JSON.stringify(BOT_PROFILES[botIdx++])]
         );
       }
-    }
-
-    await recordRoomEvent(roomId, 'ROOM_UPDATED', {});
-    await query("UPDATE rooms SET updated_at = NOW() WHERE id = $1", [roomId]);
+      if (botIdx) {
+        await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+        await emit('ROOM_UPDATED', {});
+      }
+    });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 10b. Delete / Disband Room (By Host or if inactive >= 7 minutes)
 app.post('/api/rooms/:id/delete', async (req, res) => {
   try {
-    const roomId = req.params.id;
-    const { playerId } = req.body;
-
-    const roomRes = await query('SELECT * FROM rooms WHERE id = $1', [roomId]);
-    if (roomRes.rows.length === 0) return res.json({ ok: true, message: 'Ruangan sudah tidak ada' });
-    const room = roomRes.rows[0];
-
-    const isHost = room.host_id === playerId;
-    const diffMs = Date.now() - new Date(room.updated_at).getTime();
-    const isInactive7Min = diffMs >= 7 * 60 * 1000;
-
-    if (!isHost && !isInactive7Min) {
-      return res.status(403).json({
-        error: 'Hanya host yang bisa membubarkan ruangan, atau tunggu 7 menit tanpa pergerakan.'
-      });
-    }
-
-    await recordRoomEvent(roomId, 'ROOM_DELETED', {
-      roomId,
-      reason: isHost ? 'Ruangan dibubarkan oleh Host.' : 'Ruangan otomatis dihapus karena 7 menit tidak ada pergerakan.'
+    await changeRoom(req.params.id, async (room, sql) => {
+      if (Date.now() - new Date(room.updated_at).getTime() < 7 * 60 * 1000) {
+        ensureHost(room, req.body.playerId);
+      }
+      await sql('DELETE FROM rooms WHERE id = $1', [room.id]);
+      await sql('DELETE FROM room_events WHERE room_id = $1', [room.id]);
     });
-
-    await query('DELETE FROM rooms WHERE id = $1', [roomId]);
-    await query('DELETE FROM room_events WHERE room_id = $1', [roomId]);
-
     res.json({ ok: true, message: 'Ruangan berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (err instanceof RoomError && err.status === 404) return res.json({ ok: true });
+    roomError(res, err);
   }
 });
 
 // 11. Start Game
 app.post('/api/rooms/:id/start', async (req, res) => {
   try {
-    const roomId = req.params.id;
-    const { hostId } = req.body;
+    const { hostId, version } = req.body;
+    await changeRoom(req.params.id, async (room, sql, emit) => {
+      ensureHost(room, hostId);
+      if (room.status === 'playing') return;
+      if (room.status === 'finished' && version !== undefined) {
+        const { rows: [previous] } = await sql('SELECT version FROM game_states WHERE room_id = $1', [room.id]);
+        if (previous?.version !== version) throw new RoomError(409, 'Meja sudah berubah. Sinkronkan dahulu.');
+      }
 
-    const room = (await query('SELECT * FROM rooms WHERE id = $1', [roomId])).rows[0];
-    if (!room) return res.status(404).json({ error: 'Ruangan tidak ditemukan' });
-    if (room.host_id !== hostId) return res.status(403).json({ error: 'Hanya host yang bisa memulai permainan!' });
+      const players = await sql(`
+        SELECT rp.is_bot, rp.player_id AS id,
+               COALESCE(p.name, rp.bot_profile->>'name', 'Pemain') AS name,
+               COALESCE(p.avatar, rp.bot_profile->>'avatar', '🦊') AS avatar,
+               COALESCE(p.frame, rp.bot_profile->>'frame', 'border-amber-400') AS frame
+        FROM room_players rp
+        LEFT JOIN players p ON rp.player_id = p.id
+        WHERE rp.room_id = $1
+        ORDER BY rp.seat
+      `, [room.id]);
+      if (players.rows.length < 2) throw new RoomError(400, 'Minimal butuh 2 pemain atau isi slot kosong dengan bot!');
 
-    const playersRes = await query(`
-      SELECT rp.seat, rp.is_bot, rp.is_bot as "isBot", rp.bot_profile,
-             COALESCE(p.id, rp.player_id) as id,
-             COALESCE(p.name, rp.bot_profile->>'name') as name,
-             COALESCE(p.avatar, rp.bot_profile->>'avatar') as avatar,
-             COALESCE(p.frame, rp.bot_profile->>'frame') as frame
-      FROM room_players rp
-      LEFT JOIN players p ON rp.player_id = p.id
-      WHERE rp.room_id = $1
-      ORDER BY rp.seat ASC
-    `, [roomId]);
-
-    if (playersRes.rows.length < 2) {
-      return res.status(400).json({ error: 'Minimal butuh 2 pemain atau isi slot kosong dengan bot!' });
-    }
-
-    const gameState = initGame(room.mode, playersRes.rows);
-
-    await query(
-      `INSERT INTO game_states (room_id, version, state, updated_at)
-       VALUES ($1, 1, $2, NOW())
-       ON CONFLICT (room_id) DO UPDATE SET version = game_states.version + 1, state = $2, updated_at = NOW()`,
-      [roomId, JSON.stringify(gameState)]
-    );
-
-    await query("UPDATE rooms SET status = 'playing', updated_at = NOW() WHERE id = $1", [roomId]);
-
-    await recordRoomEvent(roomId, 'GAME_START', { mode: room.mode });
-
+      const game = initGame(room.mode, players.rows);
+      const { rows: [saved] } = await sql(
+        `INSERT INTO game_states (room_id, version, state, updated_at)
+         VALUES ($1, 1, $2, NOW())
+         ON CONFLICT (room_id) DO UPDATE SET version = game_states.version + 1, state = $2, updated_at = NOW()
+         RETURNING version`,
+        [room.id, JSON.stringify(game)]
+      );
+      await sql('UPDATE rooms SET status = $2, updated_at = NOW() WHERE id = $1',
+        [room.id, game.finished ? 'finished' : 'playing']);
+      await emit('GAME_START', { mode: room.mode, version: saved.version });
+      if (game.finished) await handleGameOver(game, sql, emit);
+    });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 12. Get Game State
 app.get('/api/game/:roomId', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const playerId = req.query.playerId;
-
-    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
-    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-    let g = dbG.rows[0].state;
-    // Check 60s turn timer timeout & bot turns
-    // A bot is advanced by /bot-step, not by GET. Avoid pointless DB writes.
-    const acting = g.players[g.turn];
-    const mayTimeout = !g.finished && g.turnStartedAt &&
-      !(acting?.isBot || String(acting?.playerId || '').startsWith('bot_')) &&
-      Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000;
-    if (mayTimeout) g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
-
-    // Normal sync needs no second version query; only a timed-out human might write.
-    const latestVersion = mayTimeout
-      ? (await query('SELECT version FROM game_states WHERE room_id = $1', [roomId])).rows[0]?.version || dbG.rows[0].version
-      : dbG.rows[0].version;
-
-    let pIdx = -1;
-    if (playerId) {
-      pIdx = g.players.findIndex(p => p.playerId === playerId);
-    }
-
-    const sanitized = sanitizeGameStateForPlayer(g, pIdx);
-    res.json({ ok: true, game: sanitized, mySeat: pIdx, version: latestVersion });
+    const { roomId } = req.params;
+    const { playerId } = req.query;
+    const snapshot = await checkAndApplyTurnTimeout(roomId, await loadGame(roomId, playerId));
+    res.json(gameResponse(snapshot, playerId));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
-// 12b. Game State Sync (High-Frequency Poll for 100% reliable turn/card/event sync)
+// 12b. Game sync uses the database across server instances and sends only changed snapshots.
 app.get('/api/game/:roomId/sync', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const playerId = req.query.playerId;
-    const clientVersion = Number(req.query.version || 0);
-    const sinceEventId = Number(req.query.since || 0);
-
-    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
-    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-    let g = dbG.rows[0].state;
-
-    // Check 60s turn timeout & execute bot turns if needed
-    // A bot is advanced by /bot-step, not by GET. Avoid pointless DB writes.
-    const acting = g.players[g.turn];
-    const mayTimeout = !g.finished && g.turnStartedAt &&
-      !(acting?.isBot || String(acting?.playerId || '').startsWith('bot_')) &&
-      Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000;
-    if (mayTimeout) g = await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
-
-    // Normal sync needs no second version query; only a timed-out human might write.
-    const latestVersion = mayTimeout
-      ? (await query('SELECT version FROM game_states WHERE room_id = $1', [roomId])).rows[0]?.version || dbG.rows[0].version
-      : dbG.rows[0].version;
-
-    const eventsRes = await query(
-      'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id ASC LIMIT 50',
-      [roomId, sinceEventId]
-    );
-
-    const latestEventId = eventsRes.rows.length > 0 ? eventsRes.rows[eventsRes.rows.length - 1].id : sinceEventId;
-
-    let pIdx = -1;
-    if (playerId) {
-      pIdx = g.players.findIndex(p => p.playerId === playerId);
-    }
-
-    // The client already has this version. Transfer only new events, not the full
-    // deck/players JSON on every heartbeat.
-    const changed = Number(latestVersion) !== clientVersion;
-    const sanitized = changed ? sanitizeGameStateForPlayer(g, pIdx) : null;
-
-    res.setHeader('Cache-Control', 'no-store');
-    res.json({
-      ok: true,
-      game: sanitized,
-      mySeat: pIdx,
-      version: latestVersion,
-      events: eventsRes.rows,
-      latestEventId
-    });
+    const { roomId } = req.params;
+    const { playerId } = req.query;
+    const snapshot = await checkAndApplyTurnTimeout(roomId, await loadGame(roomId, playerId));
+    const events = await eventsSince(roomId, req.query.since);
+    res.json({ ...gameResponse(snapshot, playerId, Number(req.query.version)), ...events });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 13. Game Action
 app.post('/api/game/:roomId/action', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const { playerId, action, payload } = req.body;
-
-    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
-    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-    let g = dbG.rows[0].state;
-    // Check if timeout occurred before player acted
-    if (g.turnStartedAt && Date.now() - g.turnStartedAt >= (g.turnTimeLimitSec || 60) * 1000) {
-      await checkAndApplyTurnTimeout(roomId, g, Number(dbG.rows[0].version));
-      return res.status(409).json({ error: 'Giliran habis. Sinkronkan meja dahulu.' });
+    const { roomId } = req.params;
+    const { playerId, action, payload, version } = req.body;
+    const snapshot = await loadGame(roomId, playerId);
+    const { game } = snapshot;
+    const pIdx = gameSeat(game, playerId);
+    if (version !== undefined && version !== snapshot.version) {
+      throw new RoomError(409, 'Meja sudah berubah. Sinkronkan dan ulangi aksi.');
+    }
+    if (!game.finished && game.turnStartedAt && Date.now() - game.turnStartedAt >= (game.turnTimeLimitSec || 60) * 1000) {
+      await checkAndApplyTurnTimeout(roomId, snapshot);
+      throw new RoomError(409, 'Giliran habis. Sinkronkan meja dahulu.');
     }
 
-    const pIdx = g.players.findIndex(p => p.playerId === playerId);
-    if (pIdx === -1) return res.status(403).json({ error: 'Player not in game' });
-
-    const result = processGameAction(g, pIdx, action, payload);
-    if (!result.ok) {
-      return res.status(400).json({ error: result.error });
-    }
-
-    // Save to DB and update room activity
-    const saved = await query(
-      'UPDATE game_states SET version = version + 1, state = $1, updated_at = NOW() WHERE room_id = $2 AND version = $3 RETURNING version',
-      [JSON.stringify(g), roomId, dbG.rows[0].version]
-    );
-    if (!saved.rows.length) return res.status(409).json({ error: 'Meja sudah berubah. Sinkronkan dan ulangi aksi.' });
-    await query("UPDATE rooms SET updated_at = NOW() WHERE id = $1", [roomId]);
-
-    await recordRoomEvent(roomId, 'GAME_UPDATE', {
-      action,
-      status: g.status,
-      turn: g.turn,
-      finished: g.finished,
-      winnerText: g.winnerText
-    });
-
-    if (g.finished) {
-      await handleGameOver(roomId, g);
-    }
-
-    const finalVersion = saved.rows[0].version;
-
-    res.json({ ok: true, game: sanitizeGameStateForPlayer(g, pIdx), mySeat: pIdx, version: finalVersion });
+    const result = processGameAction(game, pIdx, action, payload);
+    if (!result.ok) throw new RoomError(400, result.error);
+    const saved = await persistMove(roomId, game, snapshot.version, action);
+    if (!saved) throw new RoomError(409, 'Meja sudah berubah. Sinkronkan dan ulangi aksi.');
+    res.json(gameResponse(saved, playerId));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
-// 13b. Explicit Bot Step API (for paced step-by-step bot turns)
+// 13b. Explicit bot steps let the frontend pace each visible AI move.
 app.post('/api/game/:roomId/bot-step', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const playerId = req.body.playerId;
-
-    const dbG = await query('SELECT state, version FROM game_states WHERE room_id = $1', [roomId]);
-    if (dbG.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-    // Only seated human participants can drive bot turns.
-    if (!playerId || !dbG.rows[0].state.players.some(p => p.playerId === playerId && !p.isBot)) {
-      return res.status(403).json({ error: 'Hanya pemain di meja yang boleh menjalankan giliran AI.' });
-    }
-
-    const step = await runBotTurnsIfNeeded(roomId, dbG.rows[0].state, Number(dbG.rows[0].version));
-    const g = step.game;
-    const latestVersion = step.version;
-
-    let pIdx = -1;
-    if (playerId) {
-      pIdx = g.players.findIndex(p => p.playerId === playerId);
-    }
-
-    res.json({
-      ok: true,
-      game: sanitizeGameStateForPlayer(g, pIdx),
-      mySeat: pIdx,
-      version: latestVersion
-    });
+    const { roomId } = req.params;
+    const { playerId, version } = req.body;
+    const snapshot = await loadGame(roomId, playerId);
+    const updated = version === undefined || version === snapshot.version
+      ? await runBotTurnsIfNeeded(roomId, snapshot.game, snapshot.version)
+      : snapshot;
+    res.json(gameResponse(updated, playerId));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 14. Server-Sent Events (SSE) Stream
-app.get('/api/events/:roomId', (req, res) => {
-  const roomId = req.params.roomId;
+app.get('/api/events/:roomId', async (req, res) => {
+  let room;
+  try {
+    room = await readRoom(req.params.roomId);
+    if (room.is_private) await readRoomPlayers(room, req.query.playerId);
+  } catch (err) {
+    return roomError(res, err);
+  }
+  const roomId = room.id;
+  if (res.destroyed) return;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1137,7 +948,7 @@ app.get('/api/events/:roomId', (req, res) => {
     res.write(': heartbeat\n\n');
   }, 15000);
 
-  req.on('close', () => {
+  res.on('close', () => {
     clearInterval(heartbeat);
     const clients = sseClients.get(roomId);
     if (clients) {
@@ -1147,59 +958,57 @@ app.get('/api/events/:roomId', (req, res) => {
   });
 });
 
+async function roomParticipant(roomId, playerId, sql) {
+  const { rows: [member] } = await sql(
+    `SELECT rp.seat, COALESCE(p.name, 'Pemain') AS name,
+            COALESCE(p.avatar, '🦊') AS avatar, gs.state
+     FROM room_players rp
+     LEFT JOIN players p ON rp.player_id = p.id
+     LEFT JOIN game_states gs ON gs.room_id = rp.room_id
+     WHERE rp.room_id = $1 AND rp.player_id = $2 AND NOT rp.is_bot`,
+    [roomId, playerId]
+  );
+  if (!member) throw new RoomError(403, 'Pemain belum bergabung di ruangan ini.', 'ROOM_MEMBERSHIP_REQUIRED');
+  const gameSeat = member.state?.players.findIndex(p => p.playerId === playerId);
+  return { ...member, seat: gameSeat >= 0 ? gameSeat : member.seat };
+}
+
 // 15. Send Chat
 app.post('/api/events/:roomId/chat', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
     const { playerId, message } = req.body;
-    if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
+    const trimmed = typeof message === 'string' ? message.trim() : '';
+    if (!trimmed || trimmed.length > 300) throw new RoomError(400, 'Pesan harus berisi 1–300 karakter.');
 
-    const p = (await query('SELECT name, avatar FROM players WHERE id = $1', [playerId])).rows[0] || { name: 'Pemain', avatar: '🦊' };
-
-    let seat = -1;
-    const dbG = await query('SELECT state FROM game_states WHERE room_id = $1', [roomId]);
-    if (dbG.rows.length > 0) {
-      const g = dbG.rows[0].state;
-      const plIdx = g.players.findIndex(pl => pl.playerId === playerId);
-      if (plIdx !== -1) seat = plIdx;
-    }
-    if (seat === -1) {
-      const rp = await query('SELECT seat FROM room_players WHERE room_id = $1 AND player_id = $2', [roomId, playerId]);
-      if (rp.rows.length > 0) seat = rp.rows[0].seat;
-    }
-
-    await recordRoomEvent(roomId, 'CHAT', {
-      playerId,
-      sender: p.name,
-      avatar: p.avatar,
-      message: message.trim(),
-      seat
+    const sender = await changeRoom(req.params.roomId, async (room, sql, emit) => {
+      const { name, avatar, seat } = await roomParticipant(room.id, playerId, sql);
+      await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+      await emit('CHAT', { playerId, sender: name, avatar, message: trimmed, seat });
+      return name;
     });
 
     res.json({ ok: true });
-
-    // Trigger Agnes AI / Bot conversational reply asynchronously
-    triggerBotChatReplyIfNeeded(roomId, p.name, message.trim());
+    if (process.env.AGNES_API_KEY) waitUntil(triggerBotChatReplyIfNeeded(req.params.roomId, sender, trimmed));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 
 // 16. Send Emote
 app.post('/api/events/:roomId/emote', async (req, res) => {
   try {
-    const roomId = req.params.roomId;
-    const { playerId, seat, emote } = req.body;
-
-    await recordRoomEvent(roomId, 'EMOTE', {
-      playerId,
-      seat,
-      emote
+    const { playerId, emote } = req.body;
+    if (typeof emote !== 'string' || !emote.trim() || emote.length > 24) {
+      throw new RoomError(400, 'Emote tidak valid.');
+    }
+    await changeRoom(req.params.roomId, async (room, sql, emit) => {
+      const { seat } = await roomParticipant(room.id, playerId, sql);
+      await sql('UPDATE rooms SET updated_at = NOW() WHERE id = $1', [room.id]);
+      await emit('EMOTE', { playerId, seat, emote });
     });
-
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    roomError(res, err);
   }
 });
 

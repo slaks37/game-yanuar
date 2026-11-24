@@ -1,11 +1,11 @@
 require('dotenv').config();
 const app = require("../server.js");
-const { query } = require("../lib/db");
+const { pool } = require("../lib/db");
 
 const server = app.listen(0, async () => {
   const port = server.address().port;
   const baseUrl = `http://localhost:${port}`;
-  console.log("Testing Rename & Intermediate Pacing at", baseUrl);
+  console.log("Testing Player Rename at", baseUrl);
 
   async function post(url, data) {
     const res = await fetch(`${baseUrl}${url}`, {
@@ -55,7 +55,7 @@ const server = app.listen(0, async () => {
     console.log("✅ Player Rename Persistence verified: Saved name is protected!");
 
     // 4. Create Room and Start Game with Bots
-    console.log("\n4. Creating room and verifying intermediate bot moves...");
+    console.log("\n4. Creating room with bots...");
     const roomRes = await post("/api/rooms", {
       name: "Meja Pacing Test",
       mode: "capsa",
@@ -63,8 +63,10 @@ const server = app.listen(0, async () => {
       hostId: testPlayerId
     });
     const roomId = roomRes.data.room.id;
-    await post(`/api/rooms/${roomId}/fill-bots`, {});
-    await post(`/api/rooms/${roomId}/start`, { hostId: testPlayerId });
+    const fill = await post(`/api/rooms/${roomId}/fill-bots`, { hostId: testPlayerId });
+    if (!fill.data.ok) throw new Error(fill.data.error || "Failed to fill bot seats");
+    const start = await post(`/api/rooms/${roomId}/start`, { hostId: testPlayerId });
+    if (!start.data.ok) throw new Error(start.data.error || "Failed to start game");
 
     // 5. Check game state: verifies player name in game_states is 'Sultan Yanuar'
     const gameSync = await get(`/api/game/${roomId}/sync?playerId=${testPlayerId}`);
@@ -88,12 +90,12 @@ const server = app.listen(0, async () => {
     }
     console.log("✅ Mid-game rename successfully updated in-memory and database game_states!");
 
-    console.log("\n>>> ALL RENAME AND PACING VERIFICATION TESTS PASSED 100%! <<<");
+    console.log("\n>>> PLAYER RENAME TESTS PASSED <<<");
   } catch (err) {
     console.error("Test failed:", err);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     server.close();
-    process.exit(0);
+    await pool.end();
   }
 });

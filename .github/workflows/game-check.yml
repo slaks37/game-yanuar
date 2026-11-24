@@ -9,10 +9,32 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: carena_test
+          POSTGRES_USER: carena_test
+          POSTGRES_PASSWORD: carena_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U carena_test -d carena_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://carena_test:carena_test@127.0.0.1:5432/carena_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Syntax and bot move regression tests
+          cache: npm
+      - run: npm ci
+      - name: Engine and client checks
         run: npm test
+      - name: Multiplayer integration against PostgreSQL
+        run: |
+          npm run init-db
+          npm run test:multiplayer
