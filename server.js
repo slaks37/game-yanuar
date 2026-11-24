@@ -327,8 +327,8 @@ function gameSeat(game, playerId) {
   return seat;
 }
 
-async function loadGame(roomId, playerId) {
-  const snapshot = await readStoredGame(roomId);
+async function loadGame(roomId, playerId, stored) {
+  const snapshot = stored ?? await readStoredGame(roomId);
   const { game, version } = snapshot;
   gameSeat(game, playerId);
   if (game.finished) return snapshot;
@@ -634,8 +634,12 @@ async function readRoomPlayers(room, playerId) {
   return players;
 }
 
-async function eventsSince(roomId, since = '0') {
-  const cursor = typeof since === 'string' && /^[0-9]{1,18}$/.test(since) ? since : '0';
+function eventCursor(since) {
+  return typeof since === 'string' && /^[0-9]{1,18}$/.test(since) ? since : '0';
+}
+
+async function eventsSince(roomId, since) {
+  const cursor = eventCursor(since);
   const { rows: events } = await query(
     'SELECT id, event_type, payload, created_at FROM room_events WHERE room_id = $1 AND id > $2 ORDER BY id LIMIT 50',
     [roomId, cursor]
@@ -871,9 +875,23 @@ app.get('/api/game/:roomId/sync', async (req, res) => {
   try {
     const { roomId } = req.params;
     const { playerId } = req.query;
-    const snapshot = await checkAndApplyTurnTimeout(roomId, await loadGame(roomId, playerId));
-    const events = await eventsSince(roomId, req.query.since);
-    res.json({ ...gameResponse(snapshot, playerId, Number(req.query.version)), ...events });
+    const since = eventCursor(req.query.since);
+    const { rows: [row] } = await query(`
+      SELECT gs.state, gs.version, ARRAY(
+        SELECT json_build_object('id', e.id::text, 'event_type', e.event_type,
+                                 'payload', e.payload, 'created_at', e.created_at)
+        FROM room_events e WHERE e.room_id = gs.room_id AND e.id > $2
+        ORDER BY e.id LIMIT 50
+      ) AS events
+      FROM game_states gs WHERE gs.room_id = $1
+    `, [roomId, since]);
+    if (!row) throw new RoomError(404, 'Permainan tidak ditemukan');
+    const loaded = await loadGame(roomId, playerId, { game: row.state, version: row.version });
+    const snapshot = await checkAndApplyTurnTimeout(roomId, loaded);
+    const delta = snapshot.version === row.version
+      ? { events: row.events, latestEventId: row.events.at(-1)?.id ?? since }
+      : await eventsSince(roomId, since);
+    res.json({ ...gameResponse(snapshot, playerId, Number(req.query.version)), ...delta });
   } catch (err) {
     roomError(res, err);
   }
