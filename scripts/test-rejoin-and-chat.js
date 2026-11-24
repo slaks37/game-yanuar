@@ -1,11 +1,11 @@
 require('dotenv').config();
 const app = require("../server.js");
-const { query } = require("../lib/db");
+const { pool } = require("../lib/db");
 
 const server = app.listen(0, async () => {
   const port = server.address().port;
   const baseUrl = `http://localhost:${port}`;
-  console.log("Testing Same-Name Rejoin & Chat Isolation at", baseUrl);
+  console.log("Testing Player Rejoin & Chat Isolation at", baseUrl);
 
   async function post(url, data) {
     const res = await fetch(`${baseUrl}${url}`, {
@@ -38,7 +38,8 @@ const server = app.listen(0, async () => {
       hostId: p1Id
     });
     const roomId = cr.data.room.id;
-    await post(`/api/rooms/${roomId}/fill-bots`, {});
+    const fill = await post(`/api/rooms/${roomId}/fill-bots`, { hostId: p1Id });
+    if (!fill.data.ok) throw new Error(fill.data.error || "Failed to fill bot seats");
     const startRes = await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
     if (!startRes.data.ok) throw new Error("Failed to start game");
 
@@ -56,12 +57,18 @@ const server = app.listen(0, async () => {
     console.log("Chat events in Room 1:", chatEvents.length, "message:", chatEvents[0]?.payload?.message);
     if (chatEvents.length === 0) throw new Error("Chat was not recorded!");
 
-    // 4. Test REJOIN with SAME NAME but DIFFERENT ID (e.g. refreshed/new tab)
-    console.log("\n4. Simulating reconnect with DIFFERENT playerId but SAME name 'Yanuar Boss'...");
+    // A display name can be shared by different users and cannot recover a seat.
     const p1RejoinId = "usr_newtab_" + Date.now();
-    const rejoinRes = await post(`/api/rooms/${roomId}/join`, {
+    const sameNameResponse = await post(`/api/rooms/${roomId}/join`, {
       playerId: p1RejoinId,
-      playerName: "Yanuar Boss"
+      playerName: pName
+    });
+    if (sameNameResponse.data.ok) throw new Error("A new ID with the same name replaced the host");
+
+    console.log("\n4. Simulating reconnect with the original player ID...");
+    const rejoinRes = await post(`/api/rooms/${roomId}/join`, {
+      playerId: p1Id,
+      playerName: pName
     });
 
     console.log("Rejoin response:", rejoinRes.status, rejoinRes.data);
@@ -74,12 +81,11 @@ const server = app.listen(0, async () => {
     if (!rejoinRes.data.reconnected) {
       throw new Error("Expected reconnected: true");
     }
-    console.log("✅ Rejoin with SAME NAME into playing game succeeded!");
+    console.log("✅ Rejoin with the original ID into playing game succeeded!");
 
-    // Verify game state returns player's private hand to the new ID
-    const gameCheck = await get(`/api/game/${roomId}?playerId=${p1RejoinId}`);
+    const gameCheck = await get(`/api/game/${roomId}?playerId=${p1Id}`);
     console.log("Game check mySeat:", gameCheck.data.mySeat);
-    if (gameCheck.data.mySeat !== 0) throw new Error("Player seat was not updated in game_states!");
+    if (gameCheck.data.mySeat !== 0) throw new Error("The original player's seat was lost");
     const myPlayer = gameCheck.data.game.players[0];
     console.log("Player name in game:", myPlayer.name, "cards in hand:", myPlayer.hand.length);
     if (!myPlayer.hand || myPlayer.hand.length === 0) {
@@ -105,7 +111,7 @@ const server = app.listen(0, async () => {
       name: "Meja Kedua Baru",
       mode: "capsa",
       maxPlayers: 4,
-      hostId: p1RejoinId
+      hostId: p1Id
     });
     const room2Id = cr2.data.room.id;
     const room2Sync = await get(`/api/rooms/${room2Id}/sync?since=0`);
@@ -116,12 +122,12 @@ const server = app.listen(0, async () => {
     }
     console.log("✅ New room has completely clean, 0-event chat history!");
 
-    console.log("\n>>> ALL SAME-NAME REJOIN & CHAT ISOLATION TESTS PASSED 100%! <<<");
+    console.log("\n>>> REJOIN & CHAT ISOLATION TESTS PASSED <<<");
   } catch (err) {
     console.error("Test failed:", err);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     server.close();
-    process.exit(0);
+    await pool.end();
   }
 });

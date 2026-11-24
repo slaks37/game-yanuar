@@ -118,11 +118,16 @@ const EMOTES = [
 const SUITS = ['♦', '♣', '♥', '♠'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 
+function createGuestId() {
+  return 'usr_' + (globalThis.crypto?.randomUUID?.() ||
+    `${Date.now()}_${Math.floor(100000 + Math.random() * 900000)}`);
+}
+
 // ==================== APP STATE ====================
 const app = {
   view: 'lobby', // 'lobby', 'lounge', 'game'
   player: {
-    id: localStorage.getItem('carena_player_id') || ('usr_' + Math.floor(100000 + Math.random() * 900000)),
+    id: localStorage.getItem('carena_player_id') || createGuestId(),
     name: localStorage.getItem('carena_player_name') || ('Pemain-' + Math.floor(100 + Math.random() * 900)),
     username: localStorage.getItem('carena_player_username') || null,
     avatar: localStorage.getItem('carena_player_avatar') || '🦊',
@@ -135,6 +140,7 @@ const app = {
     matches: 0
   },
   currentRoom: null, // Active room object
+  roomSession: 0,
   roomPlayers: [], // Seated players in lounge
   mySeat: -1,
   game: null, // Active game state
@@ -143,8 +149,8 @@ const app = {
   selectedCardIds: new Set(),
   chatOpen: false,
   unreadChat: 0,
-  sseSource: null,
   syncTimer: null,
+  serverClockOffset: 0,
   pendingJoinRoom: null
 };
 
@@ -220,9 +226,10 @@ async function apiPost(endpoint, data = {}) {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
+      body: JSON.stringify(data),
+      signal: AbortSignal.timeout?.(12000)
     });
-    return await res.json();
+    return { ...await res.json(), status: res.status };
   } catch (err) {
     console.error(`API Error POST ${endpoint}:`, err);
     return { error: 'Gagal terhubung ke server!' };
@@ -231,8 +238,8 @@ async function apiPost(endpoint, data = {}) {
 
 async function apiGet(endpoint) {
   try {
-    const res = await fetch(endpoint);
-    return await res.json();
+    const res = await fetch(endpoint, { cache: 'no-store', signal: AbortSignal.timeout?.(8000) });
+    return { ...await res.json(), status: res.status };
   } catch (err) {
     console.error(`API Error GET ${endpoint}:`, err);
     return { error: 'Gagal terhubung ke server!' };
@@ -241,13 +248,15 @@ async function apiGet(endpoint) {
 
 // ==================== AUTH & PLAYER MANAGEMENT ====================
 async function syncPlayerWithDB() {
+  const playerId = app.player.id;
   const res = await apiPost('/api/player/sync', app.player);
-  if (res && res.ok && res.player) {
+  if (app.player.id === playerId && res.ok && res.player) {
     applyPlayerProfile(res.player);
   }
 }
 
 function applyPlayerProfile(p) {
+  if (app.currentRoom && app.player.id !== p.id) returnToLobby();
   app.player.id = p.id;
   app.player.name = p.name;
   app.player.username = p.username || null;
@@ -380,9 +389,10 @@ async function registerPlayer(username, password, name) {
 }
 
 function logoutPlayer() {
+  if (app.currentRoom) returnToLobby();
   localStorage.removeItem('carena_player_username');
   app.player.username = null;
-  app.player.id = 'usr_' + Math.floor(100000 + Math.random() * 900000);
+  app.player.id = createGuestId();
   app.player.name = 'Pemain-' + Math.floor(100 + Math.random() * 900);
   app.player.coins = 2500;
   app.player.highscore = 2500;
@@ -399,18 +409,19 @@ function applyCosmetics() {
   const body = document.getElementById('app-body');
   CARD_SKINS.forEach(s => body.classList.remove(s.id));
   TABLE_SKINS.forEach(t => body.classList.remove(t.id));
-  body.classList.add(app.player.skin);
-  body.classList.add(app.player.tableSkin);
+  body.classList.add(CARD_SKINS.find(s => s.id === app.player.skin)?.id || CARD_SKINS[0].id);
+  body.classList.add(TABLE_SKINS.find(s => s.id === app.player.tableSkin)?.id || TABLE_SKINS[0].id);
 }
 
 // ==================== EVENT-BASED AI MOVE PLAYBACK ====================
-let isSyncInProgress = false;
 let botStepTimer = null;
-let botStepInFlight = false;
+let botStepRequest = null;
 let scheduledBotKey = null;
-let gameSyncPromise = null;
-let actionInFlight = false;
-const seenEventIds = new Set();
+let roomSyncRequest = null;
+let actionRequest = null;
+let joinInProgress = false;
+let startRequest = null;
+let loungeSignature = '';
 const aiMoveQueue = [];
 const aiMoveHistory = [];
 let aiMoveTimer = null;
@@ -458,33 +469,28 @@ function playNextAiMove() {
 }
 
 function ingestRoomEvents(events, latestEventId = null) {
+  const session = app.roomSession;
   for (const ev of (events || [])) {
     const id = Number(ev.id || 0);
-    if (id && seenEventIds.has(id)) continue;
-    if (id) {
-      seenEventIds.add(id);
-      if (seenEventIds.size > 250) seenEventIds.delete(seenEventIds.values().next().value);
-    }
+    if (id && id <= app.lastEventId) continue;
     handleServerEvent(ev.event_type || ev.type, ev.payload || {});
+    if (app.roomSession !== session) return;
+    if (id) app.lastEventId = id;
   }
-  // SSE does not move this cursor: polling will still fetch missed events, then dedupe.
   if (latestEventId != null) app.lastEventId = Math.max(app.lastEventId, Number(latestEventId) || 0);
 }
 
 function applyGameSnapshot(res) {
   if (!res || !res.ok || !res.game) return false;
   const version = Number(res.version || 0);
-  if (!app.game || version > Number(app.gameVersion || 0)) {
-    app.game = res.game;
-    app.gameVersion = version;
-    if (res.mySeat !== undefined && res.mySeat !== -1) app.mySeat = res.mySeat;
-    renderGameTable();
-    return true;
-  }
-  app.game.turnStartedAt = res.game.turnStartedAt;
-  app.game.turnTimeLimitSec = res.game.turnTimeLimitSec;
-  updateTurnTimersOnly();
-  return false;
+  if (app.game && version <= app.gameVersion) return false;
+  if (app.game?.turn !== res.game.turn || app.game?.finished) app.selectedCardIds.clear();
+  app.game = res.game;
+  app.gameVersion = version;
+  app.mySeat = res.mySeat ?? -1;
+  app.currentRoom.status = res.game.finished ? 'finished' : 'playing';
+  renderGameTable();
+  return true;
 }
 
 function scheduleBotStepIfNeeded() {
@@ -498,37 +504,50 @@ function scheduleBotStepIfNeeded() {
     return;
   }
   const roomId = app.currentRoom.id;
-  const key = [roomId, app.gameVersion, game.turn, game.phase || ''].join(':');
-  if (key === scheduledBotKey || botStepInFlight) return;
+  const session = app.roomSession;
+  const version = app.gameVersion;
+  const key = [session, version, game.turn, game.phase || ''].join(':');
+  if (key === scheduledBotKey || botStepRequest?.session === session) return;
   if (botStepTimer) clearTimeout(botStepTimer);
   scheduledBotKey = key;
-  const delay = Math.max(100, 1350 - (Date.now() - (game.turnStartedAt || Date.now())));
+  const delay = Math.min(1350, Math.max(350, 1350 - elapsedTurnTime(game)));
   botStepTimer = setTimeout(async () => {
     botStepTimer = null;
-    if (app.view !== 'game' || app.currentRoom?.id !== roomId || scheduledBotKey !== key || botStepInFlight) {
-      scheduledBotKey = null;
-      return;
-    }
-    botStepInFlight = true;
+    if (app.view !== 'game' || app.roomSession !== session || scheduledBotKey !== key) return;
+    const request = { session };
+    botStepRequest = request;
+    let retry = false;
     try {
-      const res = await apiPost(`/api/game/${roomId}/bot-step`, { playerId: app.player.id });
-      if (app.currentRoom?.id === roomId && app.view === 'game') applyGameSnapshot(res);
-    } catch (err) {
-      console.warn('Bot step failed:', err);
+      const res = await apiPost(`/api/game/${roomId}/bot-step`, { playerId: app.player.id, version });
+      if (app.roomSession === session && app.view === 'game' && res.ok) {
+        if (Number.isFinite(res.serverTime)) app.serverClockOffset = res.serverTime - Date.now();
+        applyGameSnapshot(res);
+        retry = true;
+      }
     } finally {
-      botStepInFlight = false;
-      scheduledBotKey = null;
-      if (app.currentRoom?.id === roomId && app.view === 'game') scheduleBotStepIfNeeded();
+      if (botStepRequest === request) botStepRequest = null;
+      if (app.roomSession === session) {
+        if (scheduledBotKey === key) scheduledBotKey = null;
+        if (retry) scheduleBotStepIfNeeded();
+      }
     }
   }, delay);
+}
+
+function elapsedTurnTime(game) {
+  return game.turnStartedAt
+    ? Math.max(0, Date.now() + app.serverClockOffset - game.turnStartedAt)
+    : 0;
+}
+
+function remainingTurnSeconds(game) {
+  return Math.max(0, (game.turnTimeLimitSec || 60) - Math.floor(elapsedTurnTime(game) / 1000));
 }
 
 function updateTurnTimersOnly() {
   const g = app.game;
   if (!g || g.finished) return;
-  const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
-  const remainingSec = Math.max(0, (g.turnTimeLimitSec || 60) - elapsedSec);
-
+  const remainingSec = remainingTurnSeconds(g);
   const timerBadgeEl = document.getElementById('game-turn-timer-text');
   if (timerBadgeEl) {
     timerBadgeEl.textContent = `${remainingSec}s`;
@@ -555,69 +574,64 @@ function updateTurnTimersOnly() {
   }
 }
 
-// GET endpoints do not run AI; share one in-flight request for polling and SSE.
-async function syncGameNow() {
-  if (gameSyncPromise) return gameSyncPromise;
-  if (app.view !== 'game' || !app.currentRoom) return;
+// Read snapshots and durable room events from the same sync API on every deployment.
+function syncCurrentRoom() {
+  const { view, roomSession: session } = app;
+  if (!app.currentRoom || view === 'lobby') return Promise.resolve();
+  if (roomSyncRequest?.session === session && roomSyncRequest.view === view) return roomSyncRequest.promise;
   const roomId = app.currentRoom.id;
-  gameSyncPromise = (async () => {
-    const res = await apiGet(`/api/game/${roomId}/sync?playerId=${encodeURIComponent(app.player.id)}&version=${app.gameVersion}&since=${app.lastEventId}`);
-    if (app.view !== 'game' || app.currentRoom?.id !== roomId) return;
-    if (res.ok) {
-      // Delta sync omits game when the version has not changed.
-      ingestRoomEvents(res.events, res.latestEventId);
-      if (res.game) applyGameSnapshot(res);
+  const playerId = encodeURIComponent(app.player.id);
+  const since = app.lastEventId;
+  const endpoint = view === 'game'
+    ? `/api/game/${roomId}/sync?playerId=${playerId}&version=${app.gameVersion}&since=${since}`
+    : `/api/rooms/${roomId}/sync?playerId=${playerId}&since=${since}`;
+  const request = { session, view };
+  roomSyncRequest = request;
+  request.promise = (async () => {
+    const res = await apiGet(endpoint);
+    if (app.view !== view || app.roomSession !== session) return;
+    if (res.status === 404 || res.status === 403) {
+      returnToLobby(res.status === 404 ? 'Ruangan sudah ditutup atau kedaluwarsa.' : res.error);
+      return;
     }
-  })().finally(() => { gameSyncPromise = null; });
-  return gameSyncPromise;
+    if (!res.ok) return;
+    if (view === 'lounge' && res.room) {
+      app.currentRoom = res.room;
+      app.roomPlayers = res.players || [];
+      const signature = JSON.stringify([res.room.status, app.roomPlayers.map(p =>
+        [p.id, p.seat, p.name, p.avatar, p.frame, p.is_ready, p.is_bot, p.is_host])]);
+      if (signature !== loungeSignature) {
+        renderLounge();
+        loungeSignature = signature;
+      }
+    } else if (view === 'game') {
+      if (Number.isFinite(res.serverTime)) app.serverClockOffset = res.serverTime - Date.now();
+      if (res.game) applyGameSnapshot(res);
+      scheduleBotStepIfNeeded();
+      updateTurnTimersOnly();
+    }
+    ingestRoomEvents(res.events, res.latestEventId);
+    if (app.view === 'lounge' && ['playing', 'finished'].includes(app.currentRoom?.status)) switchToGameView();
+  })().catch(err => console.warn('Room sync failed:', err)).finally(() => {
+    if (roomSyncRequest === request) roomSyncRequest = null;
+  });
+  return request.promise;
 }
-
-function triggerImmediateGameSync() { return syncGameNow(); }
 
 function startHeartbeatSync() {
   if (app.syncTimer) clearInterval(app.syncTimer);
   let lobbyTicks = 0;
-  let loungeSignature = '';
-  app.syncTimer = setInterval(async () => {
-    if (isSyncInProgress || document.visibilityState === 'hidden') return;
-    isSyncInProgress = true;
-    try {
-      if (app.view === 'lounge' && app.currentRoom) {
-        const roomId = app.currentRoom.id;
-        const res = await apiGet(`/api/rooms/${roomId}/sync?since=${app.lastEventId}`);
-        if (app.view !== 'lounge' || app.currentRoom?.id !== roomId) return;
-        if (res.ok && res.room) {
-          app.currentRoom = res.room;
-          app.roomPlayers = res.players || [];
-          const sig = JSON.stringify([res.room.status, app.roomPlayers.map(p =>
-            [p.id, p.seat, p.name, p.avatar, p.frame, p.is_ready, p.is_bot])]);
-          if (sig !== loungeSignature) { renderLounge(); loungeSignature = sig; }
-          ingestRoomEvents(res.events, res.latestEventId);
-          if (res.room.status === 'playing' && app.view === 'lounge') switchToGameView();
-        }
-      } else if (app.view === 'game') {
-        await syncGameNow();
-      } else if (app.view === 'lobby' && ++lobbyTicks % 5 === 0) {
-        await refreshRoomsList();
-      }
-    } catch (err) {
-      console.warn('Heartbeat sync failed:', err);
-    } finally { isSyncInProgress = false; }
+  app.syncTimer = setInterval(() => {
+    if (document.visibilityState === 'hidden') return;
+    if (app.view === 'lobby') {
+      if (++lobbyTicks % 5 === 0) refreshRoomsList();
+    } else {
+      syncCurrentRoom();
+    }
   }, 1800);
-}
-
-// ==================== SSE CONNECTION ====================
-function connectRoomSSE(roomId) {
-  if (app.sseSource) app.sseSource.close();
-  try {
-    app.sseSource = new EventSource(`/api/events/${roomId}`);
-    app.sseSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type !== 'CONNECTED') ingestRoomEvents([data]);
-      } catch (e) {}
-    };
-  } catch (e) {}
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') syncCurrentRoom();
+  });
 }
 
 function handleServerEvent(type, payload) {
@@ -629,32 +643,15 @@ function handleServerEvent(type, payload) {
     SFX.card();
     showToast('Permainan dimulai!', 'success');
     clearChatHistory();
-    app.game = null;
-    app.gameVersion = 0;
-    app.selectedCardIds.clear();
     resetAiMovePlayback();
-    switchToGameView();
   } else if (type === 'GAME_UPDATE') {
     if (payload?.move) {
       aiMoveQueue.push(payload.move);
       if (aiMoveQueue.length > 50) aiMoveQueue.shift();
       playNextAiMove();
     }
-    // The authoring client receives the new snapshot from its POST already.
-    // Skip a redundant GET for every AI card; other clients still sync.
-    if (!botStepInFlight && !actionInFlight &&
-        (!payload?.version || Number(payload.version) > Number(app.gameVersion || 0))) {
-      triggerImmediateGameSync();
-    }
   } else if (type === 'ROOM_DELETED') {
-    SFX.alert();
-    showToast(payload.reason || 'Ruangan telah dihapus', 'warn');
-    if (app.sseSource) app.sseSource.close();
-    app.currentRoom = null;
-    app.game = null;
-    clearChatHistory();
-    switchView('lobby');
-    refreshRoomsList();
+    returnToLobby(payload.reason || 'Ruangan telah dihapus');
   } else if (type === 'GAME_OVER') {
     SFX.win();
     showToast(payload.winnerText, 'success');
@@ -698,7 +695,7 @@ async function refreshRoomsList() {
           <div>
             <div class="flex items-center gap-1.5 flex-wrap">
               <span class="text-xs font-bold text-white">${escapeHtml(r.name)}</span>
-              <span class="px-1.5 py-0.2 bg-slate-800 text-amber-300 border border-slate-700 text-[10px] font-mono">#${r.code}</span>
+              <span class="px-1.5 py-0.2 bg-slate-800 text-amber-300 border border-slate-700 text-[10px] font-mono">#${escapeHtml(r.code)}</span>
               ${r.is_private ? '<span class="text-xs" title="Ruangan Private">🔒</span>' : ''}
             </div>
             <div class="text-[11px] text-slate-400 mt-1 flex items-center gap-1.5">
@@ -716,7 +713,7 @@ async function refreshRoomsList() {
           <span class="text-xs text-slate-300 font-medium">
             👥 <strong>${r.current_players}</strong> / ${r.max_players} Kursi
           </span>
-          <button data-join-room-id="${r.id}" data-is-private="${r.is_private}" class="px-3 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">
+          <button data-join-room-id="${escapeHtml(r.id)}" data-is-private="${r.is_private}" class="px-3 py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">
             ${isPlaying ? 'Masuk Meja' : 'Gabung'}
           </button>
         </div>
@@ -728,10 +725,7 @@ async function refreshRoomsList() {
       const roomId = btn.dataset.joinRoomId;
       const isPriv = btn.dataset.isPrivate === 'true';
       if (isPriv) {
-        app.pendingJoinRoom = { id: roomId };
-        document.getElementById('jp-input').value = '';
-        document.getElementById('jp-error').classList.add('hidden');
-        document.getElementById('modal-join-password').classList.remove('hidden');
+        openJoinPassword(roomId);
       } else {
         joinRoom(roomId);
       }
@@ -739,48 +733,96 @@ async function refreshRoomsList() {
   });
 }
 
-async function joinRoom(roomIdent, password = '') {
-  const nameInput = document.getElementById('input-player-name');
-  if (nameInput && nameInput.value.trim() && nameInput.value.trim() !== app.player.name) {
-    await renamePlayer(nameInput.value.trim());
-  }
+function openJoinPassword(roomIdent) {
+  app.pendingJoinRoom = roomIdent;
+  const input = document.getElementById('jp-input');
+  input.value = '';
+  document.getElementById('jp-error').classList.add('hidden');
+  document.getElementById('modal-join-password').classList.remove('hidden');
+  input.focus();
+}
 
-  // Clear chat history so every new room starts with fresh chat history
-  clearChatHistory();
+function setRoomInUrl(code) {
+  const url = new URL(window.location.href);
+  if (code) url.searchParams.set('join', code);
+  else url.searchParams.delete('join');
+  if (url.href !== window.location.href) history.replaceState(history.state, '', url);
+}
 
-  showToast('Menghubungkan ke ruangan...', 'info');
-  const res = await apiPost(`/api/rooms/${roomIdent}/join`, {
-    playerId: app.player.id,
-    playerName: app.player.name,
-    password
-  });
-
-  if (!res.ok) {
-    SFX.alert();
-    showToast(res.error || 'Gagal masuk ke ruangan!', 'error');
-    return false;
-  }
-
-  app.currentRoom = res.room;
-  app.mySeat = res.seat;
+function resetRoomSession() {
+  app.roomSession++;
+  app.currentRoom = null;
+  app.roomPlayers = [];
+  app.mySeat = -1;
   app.lastEventId = 0;
   app.game = null;
   app.gameVersion = 0;
+  app.lastSeenActionKey = '';
+  app.serverClockOffset = 0;
   app.selectedCardIds.clear();
-  seenEventIds.clear();
+  loungeSignature = '';
+  clearChatHistory();
   resetAiMovePlayback();
-  connectRoomSSE(res.room.id);
+  scheduleBotStepIfNeeded();
+}
 
-  if (res.reconnected) {
-    showToast(`Terhubung kembali ke meja sebagai "${app.player.name}"!`, 'success');
-  }
+function enterRoom(room, seat = -1) {
+  resetRoomSession();
+  app.currentRoom = room;
+  app.mySeat = seat;
+  setRoomInUrl(room.code);
+  if (['playing', 'finished'].includes(room.status)) switchToGameView();
+  else switchToLoungeView();
+}
 
-  if (res.room.status === 'playing') {
-    switchToGameView();
-  } else {
-    switchToLoungeView();
+function returnToLobby(message) {
+  resetRoomSession();
+  setRoomInUrl(null);
+  switchView('lobby');
+  if (message) showToast(message, 'warn');
+  refreshRoomsList();
+}
+
+async function joinRoom(roomIdent, password = '') {
+  if (joinInProgress) return;
+  joinInProgress = true;
+  try {
+    const nameInput = document.getElementById('input-player-name');
+    if (nameInput?.value.trim() && nameInput.value.trim() !== app.player.name) {
+      await renamePlayer(nameInput.value.trim());
+    }
+    const playerId = app.player.id;
+    const res = await apiPost(`/api/rooms/${encodeURIComponent(roomIdent)}/join`, {
+      playerId,
+      playerName: app.player.name,
+      password
+    });
+    if (app.player.id !== playerId) return;
+    if (res.ok && res.room) {
+      app.pendingJoinRoom = null;
+      document.getElementById('modal-join-password').classList.add('hidden');
+      enterRoom(res.room, res.seat);
+      if (res.reconnected) showToast(`Terhubung kembali ke meja sebagai "${app.player.name}"!`, 'success');
+      return;
+    }
+    if (!password && (res.code === 'ROOM_PASSWORD_REQUIRED' ||
+        (res.status === 403 && /password ruangan/i.test(res.error || '')))) {
+      openJoinPassword(roomIdent);
+      return;
+    }
+    const message = res.error || 'Gagal masuk ke ruangan!';
+    if (app.pendingJoinRoom === roomIdent) {
+      const errorBox = document.getElementById('jp-error');
+      errorBox.textContent = message;
+      errorBox.classList.remove('hidden');
+    } else {
+      SFX.alert();
+      showToast(message, 'error');
+    }
+    if (res.status === 404 && new URL(window.location.href).searchParams.get('join') === roomIdent) setRoomInUrl(null);
+  } finally {
+    joinInProgress = false;
   }
-  return true;
 }
 
 function renderLounge() {
@@ -795,13 +837,16 @@ function renderLounge() {
   document.getElementById('lounge-max-count').textContent = r.max_players;
 
   const hostPlayer = app.roomPlayers.find(p => p.is_host);
-  if (hostPlayer) {
-    document.getElementById('lounge-host-name').textContent = hostPlayer.name;
-  }
+  document.getElementById('lounge-host-name').textContent = hostPlayer?.name || 'Host';
 
-  const isMeHost = hostPlayer && hostPlayer.id === app.player.id;
+  const isMeHost = r.host_id === app.player.id;
   document.getElementById('btn-lounge-start').classList.toggle('hidden', !isMeHost);
   document.getElementById('btn-lounge-fill-bots').classList.toggle('hidden', !isMeHost);
+  document.getElementById('btn-lounge-delete').classList.toggle('hidden', !isMeHost);
+  const myPlayer = app.roomPlayers.find(p => p.id === app.player.id);
+  const readyButton = document.getElementById('btn-lounge-ready');
+  readyButton.disabled = !myPlayer;
+  readyButton.textContent = myPlayer?.is_ready ? '❌ Batal Siap' : '✅ Saya Siap!';
 
   // Render Seats
   const grid = document.getElementById('lounge-seats-grid');
@@ -815,8 +860,8 @@ function renderLounge() {
       seatItems.push(`
         <div class="bg-slate-950 border-2 ${isMe ? 'border-amber-400 ring-2 ring-amber-400/30' : 'border-slate-700'} p-3 flex flex-col items-center text-center gap-1.5 relative">
           ${pl.is_host ? '<span class="absolute top-1 left-1 text-sm" title="Host">👑</span>' : ''}
-          <div class="w-12 h-12 bg-slate-800 border-2 ${pl.frame || 'border-amber-400'} flex items-center justify-center text-2xl shadow">
-            ${pl.avatar || '🦊'}
+          <div class="w-12 h-12 bg-slate-800 border-2 ${escapeHtml(pl.frame || 'border-amber-400')} flex items-center justify-center text-2xl shadow">
+            ${escapeHtml(pl.avatar || '🦊')}
           </div>
           <div class="text-xs font-bold text-white truncate max-w-full">${escapeHtml(pl.name)}</div>
           <span class="px-2 py-0.5 text-[10px] font-bold ${pl.is_ready ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-slate-800 text-slate-400'}">
@@ -858,17 +903,21 @@ function switchView(viewName) {
 function switchToLoungeView() {
   switchView('lounge');
   renderLounge();
+  syncCurrentRoom();
 }
 
-async function switchToGameView() {
-  switchView('game');
-  if (app.currentRoom) {
-    const res = await apiGet(`/api/game/${app.currentRoom.id}?playerId=${app.player.id}`);
-    if (res.ok && res.game) {
-      applyGameSnapshot(res);
-      playNextAiMove();
+function switchToGameView() {
+  if (app.view !== 'game' && !app.game) {
+    document.getElementById('game-status-text').textContent = 'Menyiapkan meja...';
+    for (const id of ['opponents-container', 'table-center', 'action-bar', 'player-hand']) {
+      document.getElementById(id).replaceChildren();
     }
+    document.getElementById('btn-restart-round').classList.add('hidden');
+    document.getElementById('btn-game-delete-room').classList.toggle('hidden', app.currentRoom.host_id !== app.player.id);
   }
+  switchView('game');
+  syncCurrentRoom();
+  playNextAiMove();
 }
 
 // ==================== IN-GAME TABLE RENDERING ====================
@@ -880,52 +929,41 @@ function renderGameTable() {
   document.getElementById('game-mode-icon').textContent = mode.icon;
   document.getElementById('game-mode-title').textContent = mode.name;
   document.getElementById('game-status-text').textContent = g.status;
+  const isHost = app.currentRoom?.host_id === app.player.id;
+  document.getElementById('btn-restart-round').classList.toggle('hidden', !g.finished || !isHost);
+  document.getElementById('btn-game-delete-room').classList.toggle('hidden', !isHost);
+  const turnName = escapeHtml(g.players[g.turn]?.name);
 
-  // 1. Resolve My Player Index strictly by playerId (Prevents seat mismatch / desync)
-  let myIdx = -1;
-  if (g.players) {
-    myIdx = g.players.findIndex(p => p.playerId === app.player.id);
-  }
-  if (myIdx === -1 && app.mySeat >= 0 && app.mySeat < (g.players ? g.players.length : 0)) {
-    myIdx = app.mySeat;
-  }
+  const myIdx = g.players.findIndex(p => p.playerId === app.player.id);
   app.mySeat = myIdx;
 
-  // Turn Timer calculation (60s max per turn)
-  const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
-  const remainingSec = Math.max(0, (g.turnTimeLimitSec || 60) - elapsedSec);
-  const timerBadgeEl = document.getElementById('game-turn-timer-text');
-  if (timerBadgeEl) {
-    timerBadgeEl.textContent = `${remainingSec}s`;
-    const parent = timerBadgeEl.parentElement;
-    if (parent) {
-      parent.classList.toggle('border-rose-500', remainingSec <= 10);
-      parent.classList.toggle('text-rose-400', remainingSec <= 10);
-      parent.classList.toggle('border-amber-400', remainingSec > 10);
-      parent.classList.toggle('text-amber-300', remainingSec > 10);
-    }
-  }
+  const remainingSec = remainingTurnSeconds(g);
+  document.getElementById('game-turn-timer-badge').classList.toggle('hidden', g.finished);
 
   // 2. Render Opponents
   const oppBox = document.getElementById('opponents-container');
   const opps = g.players.filter((p, idx) => idx !== myIdx);
+  const fishOpponents = g.mode === 'gofish' ? opps.filter(p => (p.handCount ?? p.hand.length) > 0) : [];
+  const fishTarget = fishOpponents.find(p => p.id === g.targetPlayerIdx) || fishOpponents[0];
 
   oppBox.innerHTML = opps.map(p => {
     const isTurn = !g.finished && g.turn === p.id;
-    let subText = `${p.handCount !== undefined ? p.handCount : p.hand.length} Kartu`;
-    if (g.mode === 'gofish') subText = `${p.handCount} Krt · ${p.books || 0} Book`;
+    const handCount = p.handCount ?? p.hand.length;
+    let subText = `${handCount} Kartu`;
+    if (g.mode === 'gofish') subText = `${handCount} Krt · ${p.books || 0} Book`;
     else if (g.mode === 'minuman') subText = `${p.score || 0} Tantangan`;
-    else if (g.mode === 'blackjack') subText = p.status || `Total: ?`;
+    else if (g.mode === 'blackjack') subText = p.status || 'Total: ?';
 
-    const isGoFishTarget = g.mode === 'gofish' && g.targetPlayerIdx === p.id;
-    const clickCls = g.mode === 'gofish' ? 'cursor-pointer hover:border-amber-400' : '';
+    const isGoFishTarget = fishTarget?.id === p.id;
+    const canTarget = fishOpponents.includes(p);
+    const clickCls = canTarget ? 'cursor-pointer hover:border-amber-400' : '';
     const turnBadge = isTurn ? `<span data-turn-timer class="px-1 py-0.5 bg-amber-400 text-slate-950 text-[9px] font-mono font-extrabold ml-1">⏱️ ${remainingSec}s</span>` : '';
     return `
-      <div data-opp-seat="${p.id}" class="relative bg-slate-950/85 border-2 ${isGoFishTarget ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-slate-700'} ${isTurn ? 'active-turn-seat ring-2 ring-amber-400' : ''} ${clickCls} px-2.5 py-1.5 flex items-center gap-2 min-w-[112px] transition">
-        <div class="w-8 h-8 bg-slate-800 border-2 ${p.frame || 'border-amber-400'} flex items-center justify-center text-base shrink-0">${p.avatar}</div>
+      <div data-opp-seat="${p.id}" ${canTarget ? 'data-fish-target' : ''} class="relative bg-slate-950/85 border-2 ${isGoFishTarget ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-slate-700'} ${isTurn ? 'active-turn-seat ring-2 ring-amber-400' : ''} ${clickCls} px-2.5 py-1.5 flex items-center gap-2 min-w-[112px] transition">
+        <div class="w-8 h-8 bg-slate-800 border-2 ${escapeHtml(p.frame || 'border-amber-400')} flex items-center justify-center text-base shrink-0">${escapeHtml(p.avatar)}</div>
         <div class="leading-tight min-w-0">
           <div class="text-[11px] font-bold text-white truncate flex items-center">${escapeHtml(p.name)} ${turnBadge}</div>
-          <div class="text-[10px] text-amber-300 font-medium">${subText}</div>
+          <div class="text-[10px] text-amber-300 font-medium">${escapeHtml(subText)}</div>
         </div>
         <div id="emote-anchor-${p.id}" class="absolute -top-4 left-1/2"></div>
         <div id="speech-anchor-${p.id}" class="absolute -top-8 left-1/2"></div>
@@ -933,7 +971,7 @@ function renderGameTable() {
   }).join('');
 
   if (g.mode === 'gofish') {
-    oppBox.querySelectorAll('[data-opp-seat]').forEach(el => {
+    oppBox.querySelectorAll('[data-fish-target]').forEach(el => {
       el.addEventListener('click', () => {
         g.targetPlayerIdx = Number(el.dataset.oppSeat);
         renderGameTable();
@@ -947,14 +985,7 @@ function renderGameTable() {
   document.getElementById('my-seat-name').textContent = me.name;
   const isMyTurn = !g.finished && g.turn === myIdx;
   document.getElementById('my-turn-pill').classList.toggle('hidden', !isMyTurn);
-  const myTurnTimer = document.getElementById('my-turn-timer');
-  if (myTurnTimer) {
-    myTurnTimer.classList.toggle('hidden', !isMyTurn);
-    myTurnTimer.textContent = `⏱️ ${remainingSec}s`;
-    myTurnTimer.className = remainingSec <= 10
-      ? 'px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse'
-      : 'px-1.5 py-0.5 bg-amber-500 text-slate-950 text-[10px] font-mono font-extrabold';
-  }
+  document.getElementById('my-turn-timer').classList.toggle('hidden', !isMyTurn);
   document.getElementById('my-seat-badge').classList.toggle('active-turn-seat', isMyTurn);
 
   let mySub = `${me.hand ? me.hand.length : 0} Kartu`;
@@ -971,14 +1002,12 @@ function renderGameTable() {
       <div class="bg-slate-950/90 border-4 border-amber-400 px-6 py-4 max-w-md shadow-2xl space-y-2">
         <div class="text-2xl">🏆</div>
         <div class="text-sm sm:text-base font-extrabold text-amber-300">${escapeHtml(g.winnerText)}</div>
-        <button id="btn-center-rematch" class="mt-2 px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs border-2 border-black">
+        ${isHost ? `<button id="btn-center-rematch" class="mt-2 px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs border-2 border-black">
           Mulai Ronde Baru
-        </button>
+        </button>` : ''}
       </div>`;
     actions.innerHTML = '';
-    document.getElementById('btn-center-rematch')?.addEventListener('click', () => {
-      apiPost(`/api/rooms/${app.currentRoom.id}/start`, { hostId: app.player.id });
-    });
+    document.getElementById('btn-center-rematch')?.addEventListener('click', startCurrentRound);
   } else if (g.mode === 'capsa') {
     center.innerHTML = g.tablePlay
       ? `<div class="text-[11px] font-semibold text-emerald-200 mb-1">${escapeHtml(g.players[g.tablePlay.by].name)} · <span class="text-amber-300 font-bold">${escapeHtml(g.tablePlay.label || '')}</span></div>
@@ -988,7 +1017,7 @@ function renderGameTable() {
     actions.innerHTML = isMyTurn ? `
       <button id="act-capsa-play" class="px-3.5 py-1.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">Keluarkan (${app.selectedCardIds.size})</button>
       <button id="act-capsa-pass" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-black">Pass</button>
-    ` : `<span class="text-xs text-emerald-200/80 font-medium">Menunggu giliran ${g.players[g.turn].name}...</span>`;
+    ` : `<span class="text-xs text-emerald-200/80 font-medium">Menunggu giliran ${turnName}...</span>`;
 
     document.getElementById('act-capsa-play')?.addEventListener('click', () => {
       submitGameAction('play', { cardIds: Array.from(app.selectedCardIds) });
@@ -1036,26 +1065,26 @@ function renderGameTable() {
       </div>`;
     actions.innerHTML = isMyTurn ? `
       <button id="act-7up-pass" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border-2 border-black">Pass (Tidak Ada Kartu)</button>
-    ` : `<span class="text-xs text-emerald-200/80">Menunggu ${g.players[g.turn].name}...</span>`;
+    ` : `<span class="text-xs text-emerald-200/80">Menunggu ${turnName}...</span>`;
     document.getElementById('act-7up-pass')?.addEventListener('click', () => submitGameAction('pass'));
   } else if (g.mode === 'gofish') {
     const myRanks = [...new Set(me.hand.map(c => c.rank))];
-    const target = g.players[g.targetPlayerIdx] || opps[0] || g.players[1];
+    const selectedRank = myRanks.includes(g.selectedRank) ? g.selectedRank : myRanks[0];
     center.innerHTML = `
       <div class="text-xs font-semibold text-emerald-100 max-w-md">${escapeHtml(g.lastFishLog || '')}</div>
-      <div class="text-[11px] text-amber-300">Target Lawan: <strong>${escapeHtml(target.name)}</strong> (klik kursi lawan untuk ganti)</div>
+      ${fishTarget ? `<div class="text-[11px] text-amber-300">Target Lawan: <strong>${escapeHtml(fishTarget.name)}</strong> (klik kursi lawan untuk ganti)</div>` : ''}
       ${isMyTurn && myRanks.length ? `
         <div class="flex flex-wrap items-center justify-center gap-1.5 mt-1">
-          ${myRanks.map(r => `<button data-fish-rank="${r}" class="px-2.5 py-1 text-xs font-bold border-2 ${g.selectedRank === r ? 'bg-amber-400 text-slate-950 border-black' : 'bg-slate-900/80 text-white border-slate-600'}">${r}</button>`).join('')}
+          ${myRanks.map(r => `<button data-fish-rank="${r}" class="px-2.5 py-1 text-xs font-bold border-2 ${selectedRank === r ? 'bg-amber-400 text-slate-950 border-black' : 'bg-slate-900/80 text-white border-slate-600'}">${r}</button>`).join('')}
         </div>` : ''}`;
-    actions.innerHTML = isMyTurn ? `
-      <button id="act-fish-ask" class="px-3.5 py-1.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">Minta ${g.selectedRank || myRanks[0]} ke ${escapeHtml(target.name)}</button>
-    ` : `<span class="text-xs text-emerald-200/80">Menunggu ${g.players[g.turn].name}...</span>`;
+    actions.innerHTML = isMyTurn && fishTarget && selectedRank ? `
+      <button id="act-fish-ask" class="px-3.5 py-1.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">Minta ${selectedRank} ke ${escapeHtml(fishTarget.name)}</button>
+    ` : `<span class="text-xs text-emerald-200/80">Menunggu ${turnName}...</span>`;
     center.querySelectorAll('[data-fish-rank]').forEach(b => {
       b.addEventListener('click', () => { g.selectedRank = b.dataset.fishRank; renderGameTable(); });
     });
     document.getElementById('act-fish-ask')?.addEventListener('click', () => {
-      submitGameAction('ask', { targetIdx: target.id, rank: g.selectedRank || myRanks[0] });
+      submitGameAction('ask', { targetIdx: fishTarget.id, rank: selectedRank });
     });
   } else if (g.mode === 'bohong') {
     const targetRank = RANKS[g.targetRankIdx];
@@ -1090,7 +1119,7 @@ function renderGameTable() {
       </div>`;
     actions.innerHTML = isMyTurn ? `
       ${g.phase === 'draw' ? `<button id="act-41-knock" class="px-3.5 py-1.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">Tutup Meja (41!)</button>` : '<span class="text-xs font-bold text-amber-300">Klik 1 kartu di tanganmu untuk dibuang ↓</span>'}
-    ` : `<span class="text-xs text-emerald-200/80">Giliran ${g.players[g.turn].name}...</span>`;
+    ` : `<span class="text-xs text-emerald-200/80">Giliran ${turnName}...</span>`;
     document.getElementById('act-41-deck')?.addEventListener('click', () => {
       if (isMyTurn && g.phase === 'draw') submitGameAction('draw', { source: 'deck' });
     });
@@ -1109,7 +1138,7 @@ function renderGameTable() {
       </div>`;
     actions.innerHTML = isMyTurn ? `
       <button id="act-minuman-draw" class="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs border-2 border-black">🍻 Tarik Kartu</button>
-    ` : `<span class="text-xs text-emerald-200/80">Giliran ${g.players[g.turn].name}...</span>`;
+    ` : `<span class="text-xs text-emerald-200/80">Giliran ${turnName}...</span>`;
     document.getElementById('act-minuman-draw')?.addEventListener('click', () => submitGameAction('draw'));
   } else if (g.mode === 'blackjack') {
     center.innerHTML = `
@@ -1123,7 +1152,7 @@ function renderGameTable() {
       <button id="act-bj-hit" class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs border-2 border-black">Hit (+Kartu)</button>
       <button id="act-bj-stand" class="px-3.5 py-1.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs border-2 border-black">Stand</button>
       <button id="act-bj-double" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-400 text-white font-bold text-xs border-2 border-black">Double (2x)</button>
-    ` : `<span class="text-xs text-emerald-200/80">Giliran ${g.players[g.turn].name}...</span>`;
+    ` : `<span class="text-xs text-emerald-200/80">Giliran ${turnName}...</span>`;
     document.getElementById('act-bj-hit')?.addEventListener('click', () => submitGameAction('hit'));
     document.getElementById('act-bj-stand')?.addEventListener('click', () => submitGameAction('stand'));
     document.getElementById('act-bj-double')?.addEventListener('click', () => submitGameAction('double'));
@@ -1175,29 +1204,50 @@ function renderGameTable() {
   }
 
   // 6. Schedule next step if turn is a bot
+  updateTurnTimersOnly();
   scheduleBotStepIfNeeded();
 }
 
 async function submitGameAction(action, payload = {}) {
-  // Double taps must not submit duplicate moves or overwrite a newer snapshot.
-  if (!app.currentRoom || actionInFlight) return;
+  if (!app.currentRoom || actionRequest?.session === app.roomSession) return;
   const roomId = app.currentRoom.id;
-  actionInFlight = true;
+  const request = { session: app.roomSession };
+  actionRequest = request;
   try {
     const res = await apiPost(`/api/game/${roomId}/action`, {
-      playerId: app.player.id, action, payload
+      playerId: app.player.id, action, payload, version: app.gameVersion
     });
-    if (app.currentRoom?.id !== roomId) return;
+    if (app.roomSession !== request.session || app.view !== 'game') return;
     if (!res.ok) {
       SFX.alert();
       showToast(res.error || 'Aksi kartu tidak valid!', 'error');
-      if (/berubah|Sinkronkan|giliran habis/i.test(res.error || '')) await triggerImmediateGameSync();
+      if ([403, 404, 409].includes(res.status)) syncCurrentRoom();
       return;
     }
     app.selectedCardIds.clear();
     applyGameSnapshot(res);
   } finally {
-    actionInFlight = false;
+    if (actionRequest === request) actionRequest = null;
+  }
+}
+
+async function startCurrentRound() {
+  if (!app.currentRoom || startRequest?.session === app.roomSession) return;
+  const request = { session: app.roomSession };
+  startRequest = request;
+  try {
+    const res = await apiPost(`/api/rooms/${app.currentRoom.id}/start`, {
+      hostId: app.player.id,
+      version: app.gameVersion
+    });
+    if (app.roomSession !== request.session) return;
+    if (res.ok) switchToGameView();
+    else {
+      showToast(res.error || 'Gagal memulai permainan', 'error');
+      syncCurrentRoom();
+    }
+  } finally {
+    if (startRequest === request) startRequest = null;
   }
 }
 
@@ -1206,18 +1256,15 @@ async function deleteCurrentRoom() {
   const ok = confirm('Yakin ingin membubarkan/menghapus ruangan ini?');
   if (!ok) return;
 
+  const session = app.roomSession;
   const res = await apiPost(`/api/rooms/${app.currentRoom.id}/delete`, {
     playerId: app.player.id
   });
 
+  if (app.roomSession !== session) return;
   if (res.ok) {
+    returnToLobby();
     showToast('Ruangan berhasil dihapus / dibubarkan', 'info');
-    if (app.sseSource) app.sseSource.close();
-    app.currentRoom = null;
-    app.game = null;
-    clearChatHistory();
-    switchView('lobby');
-    refreshRoomsList();
   } else {
     showToast(res.error || 'Gagal menghapus ruangan', 'error');
   }
@@ -1226,43 +1273,7 @@ async function deleteCurrentRoom() {
 function startTurnCountdownTicker() {
   if (app.tickerInterval) clearInterval(app.tickerInterval);
   app.tickerInterval = setInterval(() => {
-    if (app.view !== 'game' || !app.game || app.game.finished) return;
-
-    const g = app.game;
-    const elapsedSec = Math.floor((Date.now() - (g.turnStartedAt || Date.now())) / 1000);
-    const limit = g.turnTimeLimitSec || 60;
-    const remainingSec = Math.max(0, limit - elapsedSec);
-
-    const timerBadgeEl = document.getElementById('game-turn-timer-text');
-    if (timerBadgeEl) {
-      timerBadgeEl.textContent = `${remainingSec}s`;
-      const parent = timerBadgeEl.parentElement;
-      if (parent) {
-        parent.classList.toggle('border-rose-500', remainingSec <= 10);
-        parent.classList.toggle('text-rose-400', remainingSec <= 10);
-        parent.classList.toggle('border-amber-400', remainingSec > 10);
-        parent.classList.toggle('text-amber-300', remainingSec > 10);
-      }
-    }
-
-    const myIdx = g.players.findIndex(p => p.playerId === app.player.id);
-    const isMyTurn = !g.finished && g.turn === myIdx;
-    const myTurnTimer = document.getElementById('my-turn-timer');
-    if (myTurnTimer) {
-      myTurnTimer.classList.toggle('hidden', !isMyTurn);
-      myTurnTimer.textContent = `⏱️ ${remainingSec}s`;
-      myTurnTimer.className = remainingSec <= 10
-        ? 'px-1.5 py-0.5 bg-rose-600 text-white text-[10px] font-mono font-extrabold animate-pulse'
-        : 'px-1.5 py-0.5 bg-amber-500 text-slate-950 text-[10px] font-mono font-extrabold';
-    }
-
-    // If time ran out, trigger sync so server executes auto pass/action
-    if (remainingSec === 0 && !app.isTimeoutSyncing) {
-      app.isTimeoutSyncing = true;
-      triggerImmediateGameSync().finally(() => {
-        setTimeout(() => { app.isTimeoutSyncing = false; }, 2000);
-      });
-    }
+    if (app.view === 'game') updateTurnTimersOnly();
   }, 1000);
 }
 
@@ -1295,22 +1306,29 @@ function triggerSpeechBubble(seatIdx, text) {
   setTimeout(() => bubble.remove(), 4500);
 }
 
-function sendChatMessage(msg) {
+async function sendChatMessage(msg) {
   if (!app.currentRoom || !msg || !msg.trim()) return;
-  apiPost(`/api/events/${app.currentRoom.id}/chat`, {
+  const session = app.roomSession;
+  const res = await apiPost(`/api/events/${app.currentRoom.id}/chat`, {
     playerId: app.player.id,
     message: msg.trim()
   });
-  triggerSpeechBubble(app.mySeat, msg.trim());
+  if (app.roomSession !== session) return;
+  if (!res.ok) showToast(res.error || 'Pesan gagal dikirim.', 'error');
+  else syncCurrentRoom();
 }
 
-function sendEmote(emote) {
+async function sendEmote(emote) {
   if (!app.currentRoom) return;
-  apiPost(`/api/events/${app.currentRoom.id}/emote`, {
+  const session = app.roomSession;
+  const res = await apiPost(`/api/events/${app.currentRoom.id}/emote`, {
     playerId: app.player.id,
     seat: app.mySeat,
     emote
   });
+  if (app.roomSession !== session) return;
+  if (!res.ok) showToast(res.error || 'Emote gagal dikirim.', 'error');
+  else syncCurrentRoom();
 }
 
 function clearChatHistory() {
@@ -1326,7 +1344,7 @@ function addChatMessage(sender, avatar, text) {
   const msg = document.createElement('div');
   msg.className = 'bg-slate-950 border border-slate-800 p-2 flex items-start gap-2';
   msg.innerHTML = `
-    <span class="text-base">${avatar || '🦊'}</span>
+    <span class="text-base">${escapeHtml(avatar || '🦊')}</span>
     <div class="leading-tight min-w-0">
       <div class="text-[11px] font-bold text-amber-300 truncate">${escapeHtml(sender)}</div>
       <div class="text-[11px] text-slate-200 break-words mt-0.5">${escapeHtml(text)}</div>
@@ -1361,7 +1379,7 @@ async function showLeaderboard() {
       <div class="bg-slate-950 border border-slate-800 p-2.5 flex items-center justify-between gap-3">
         <div class="flex items-center gap-2.5 min-w-0">
           <span class="pixel-font text-xs text-amber-300 w-7 text-center shrink-0">${medal}</span>
-          <div class="w-8 h-8 bg-slate-800 border-2 ${p.frame || 'border-amber-400'} flex items-center justify-center text-base shrink-0">${p.avatar || '🦊'}</div>
+          <div class="w-8 h-8 bg-slate-800 border-2 ${escapeHtml(p.frame || 'border-amber-400')} flex items-center justify-center text-base shrink-0">${escapeHtml(p.avatar || '🦊')}</div>
           <div class="truncate">
             <div class="font-bold text-white text-xs truncate flex items-center gap-1.5">
               <span>${escapeHtml(p.name)}</span>
@@ -1582,10 +1600,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Create Room form submit
   document.getElementById('form-create-room').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const submit = e.currentTarget.querySelector('button[type="submit"]');
+    if (submit.disabled) return;
     const nameInput = document.getElementById('input-player-name');
-    if (nameInput && nameInput.value.trim() && nameInput.value.trim() !== app.player.name) {
-      await renamePlayer(nameInput.value.trim());
-    }
     const name = document.getElementById('cr-name').value.trim();
     const mode = document.getElementById('cr-mode').value;
     const maxPlayers = Number(document.getElementById('cr-max').value);
@@ -1597,21 +1614,24 @@ window.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    const res = await apiPost('/api/rooms', {
-      name,
-      mode,
-      maxPlayers,
-      password,
-      isPrivate,
-      hostId: app.player.id
-    });
-
-    if (res.ok && res.room) {
-      document.getElementById('modal-create-room').classList.add('hidden');
-      showToast(`Ruangan #${res.room.code} berhasil dibuat!`, 'success');
-      joinRoom(res.room.id);
-    } else {
-      showToast(res.error || 'Gagal membuat ruangan', 'error');
+    submit.disabled = true;
+    try {
+      if (nameInput?.value.trim() && nameInput.value.trim() !== app.player.name) {
+        await renamePlayer(nameInput.value.trim());
+      }
+      const hostId = app.player.id;
+      const res = await apiPost('/api/rooms', { name, mode, maxPlayers, password, isPrivate, hostId });
+      if (app.player.id !== hostId) return;
+      if (res.ok && res.room) {
+        document.getElementById('modal-create-room').classList.add('hidden');
+        document.getElementById('cr-password').value = '';
+        showToast(`Ruangan #${res.room.code} berhasil dibuat!`, 'success');
+        enterRoom({ ...res.room, host_id: res.room.host_id || hostId }, 0);
+      } else {
+        showToast(res.error || 'Gagal membuat ruangan', 'error');
+      }
+    } finally {
+      submit.disabled = false;
     }
   });
 
@@ -1630,19 +1650,18 @@ window.addEventListener('DOMContentLoaded', async () => {
     e.preventDefault();
     if (!app.pendingJoinRoom) return;
     const pass = document.getElementById('jp-input').value.trim();
-    const ok = await joinRoom(app.pendingJoinRoom.id, pass);
-    if (ok) {
-      document.getElementById('modal-join-password').classList.add('hidden');
-    } else {
-      document.getElementById('jp-error').classList.remove('hidden');
-    }
+    if (pass) await joinRoom(app.pendingJoinRoom, pass);
   });
 
   // Lounge Actions
   document.getElementById('btn-copy-invite-link').addEventListener('click', () => {
     if (!app.currentRoom) return;
-    const url = `${window.location.origin}/?join=${app.currentRoom.code}`;
-    navigator.clipboard?.writeText(url).then(() => {
+    const url = `${window.location.origin}/?join=${encodeURIComponent(app.currentRoom.code)}`;
+    if (!navigator.clipboard) {
+      prompt('Salin link undangan ini:', url);
+      return;
+    }
+    navigator.clipboard.writeText(url).then(() => {
       showToast('Link undangan disalin ke clipboard! 📋', 'success');
     }).catch(() => {
       prompt('Salin link undangan ini:', url);
@@ -1652,53 +1671,41 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-lounge-ready').addEventListener('click', async () => {
     if (!app.currentRoom) return;
     const myPl = app.roomPlayers.find(p => p.id === app.player.id);
-    const newReady = !(myPl && myPl.is_ready);
-    await apiPost(`/api/rooms/${app.currentRoom.id}/ready`, {
+    if (!myPl) return;
+    const session = app.roomSession;
+    const res = await apiPost(`/api/rooms/${app.currentRoom.id}/ready`, {
       playerId: app.player.id,
-      isReady: newReady
+      isReady: !myPl.is_ready
     });
-    document.getElementById('btn-lounge-ready').textContent = newReady ? '❌ Batal Siap' : '✅ Saya Siap!';
+    if (app.roomSession !== session) return;
+    if (!res.ok) showToast(res.error || 'Status siap gagal diperbarui.', 'error');
+    syncCurrentRoom();
   });
 
   document.getElementById('btn-lounge-fill-bots').addEventListener('click', async () => {
     if (!app.currentRoom) return;
-    await apiPost(`/api/rooms/${app.currentRoom.id}/fill-bots`, {});
-    showToast('Kursi kosong diisi oleh Bot AI!', 'success');
+    const session = app.roomSession;
+    const res = await apiPost(`/api/rooms/${app.currentRoom.id}/fill-bots`, { hostId: app.player.id });
+    if (app.roomSession !== session) return;
+    if (res.ok) showToast('Kursi kosong diisi oleh Bot AI!', 'success');
+    else showToast(res.error || 'Kursi gagal diisi.', 'error');
+    syncCurrentRoom();
   });
 
-  document.getElementById('btn-lounge-start').addEventListener('click', async () => {
-    if (!app.currentRoom) return;
-    const res = await apiPost(`/api/rooms/${app.currentRoom.id}/start`, {
-      hostId: app.player.id
-    });
-    if (res.ok) {
-      switchToGameView();
-    } else {
-      showToast(res.error || 'Gagal memulai permainan', 'error');
-    }
-  });
+  document.getElementById('btn-lounge-start').addEventListener('click', startCurrentRound);
+  document.getElementById('btn-restart-round').addEventListener('click', startCurrentRound);
 
   document.getElementById('btn-lounge-leave').addEventListener('click', async () => {
     if (!app.currentRoom) return;
-    await apiPost(`/api/rooms/${app.currentRoom.id}/leave`, { playerId: app.player.id });
-    if (app.sseSource) app.sseSource.close();
-    app.currentRoom = null;
-    clearChatHistory();
-    switchView('lobby');
-    refreshRoomsList();
+    const session = app.roomSession;
+    const res = await apiPost(`/api/rooms/${app.currentRoom.id}/leave`, { playerId: app.player.id });
+    if (app.roomSession !== session) return;
+    if (res.ok || res.status === 404) returnToLobby();
+    else showToast(res.error || 'Gagal keluar dari ruangan.', 'error');
   });
 
-  document.getElementById('btn-back-lobby').addEventListener('click', () => {
-    clearChatHistory();
-    switchView('lobby');
-    refreshRoomsList();
-  });
-
-  document.getElementById('btn-game-lobby')?.addEventListener('click', () => {
-    clearChatHistory();
-    switchView('lobby');
-    refreshRoomsList();
-  });
+  document.getElementById('btn-back-lobby').addEventListener('click', () => returnToLobby());
+  document.getElementById('btn-game-lobby').addEventListener('click', () => returnToLobby());
 
   document.getElementById('btn-clear-chat')?.addEventListener('click', () => {
     clearChatHistory();
@@ -1738,6 +1745,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Modal Closers
   document.querySelectorAll('[data-close-modal]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if (btn.dataset.closeModal === 'modal-join-password') app.pendingJoinRoom = null;
       document.getElementById(btn.dataset.closeModal).classList.add('hidden');
     });
   });

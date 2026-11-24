@@ -1,6 +1,6 @@
 require('dotenv').config();
 const app = require("../server.js");
-const { query } = require("../lib/db");
+const { pool } = require("../lib/db");
 
 const server = app.listen(0, async () => {
   const port = server.address().port;
@@ -23,7 +23,7 @@ const server = app.listen(0, async () => {
 
   try {
     const p1User = "human_" + Math.random().toString(36).substring(7);
-    const reg1 = await post("/api/auth/register", { username: p1User, password: "password123", displayName: "Human Boss" });
+    const reg1 = await post("/api/auth/register", { username: p1User, password: "password123", name: "Human Boss" });
     const p1Id = reg1.data.player.id;
 
     console.log("1. Creating room for Capsa Banting...");
@@ -34,14 +34,14 @@ const server = app.listen(0, async () => {
       hostId: p1Id
     });
     const roomId = cr.data.room.id;
-    const roomCode = cr.data.room.code;
-
     console.log("2. Filling empty seats with Bots...");
-    const fillRes = await post(`/api/rooms/${roomId}/fill-bots`, {});
+    const fillRes = await post(`/api/rooms/${roomId}/fill-bots`, { hostId: p1Id });
+    if (!fillRes.data.ok) throw new Error(fillRes.data.error || "Failed to fill bot seats");
     console.log("Fill bots response:", fillRes.data);
 
     console.log("3. Host starting the game...");
     const startRes = await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
+    if (!startRes.data.ok) throw new Error(startRes.data.error || "Failed to start game");
     console.log("Start game response:", startRes.data);
 
     console.log("4. Fetching initial game sync for Human...");
@@ -53,7 +53,7 @@ const server = app.listen(0, async () => {
 
     // Verify all 3 bots have isBot === true
     const bots = g.players.filter(p => p.id !== sync1.data.mySeat);
-    const allBotsMarked = bots.every(b => b.isBot === true);
+    const allBotsMarked = bots.length === 3 && bots.every(b => b.isBot === true);
     console.log("Are all other players correctly identified as bots?", allBotsMarked);
     if (!allBotsMarked) {
       throw new Error("One or more bots were NOT marked as isBot = true!");
@@ -62,6 +62,7 @@ const server = app.listen(0, async () => {
     // Now let's simulate rounds of play:
     console.log("\n5. Simulating rounds between Human and Bots...");
     let rounds = 0;
+    let botMoves = 0;
     while (!g.finished && rounds < 10) {
       const curSync = await get(`/api/game/${roomId}/sync?playerId=${p1Id}`);
       const curG = curSync.data.game;
@@ -74,10 +75,15 @@ const server = app.listen(0, async () => {
       console.log(`Round ${rounds + 1}: Turn is with ${activePl.name} (Seat ${curG.turn}, isBot: ${activePl.isBot})`);
 
       if (activePl.isBot) {
-        // If turn is on bot, calling sync should execute bot turn!
-        console.log("Triggering bot turn via sync...");
-        const afterBot = await get(`/api/game/${roomId}/sync?playerId=${p1Id}`);
-        console.log("After bot sync, turn is:", afterBot.data.game.players[afterBot.data.game.turn].name);
+        const rest = Math.max(0, 1300 - (Date.now() - curG.turnStartedAt));
+        await new Promise(resolve => setTimeout(resolve, rest));
+        const step = await post(`/api/game/${roomId}/bot-step`, {
+          playerId: p1Id, version: curSync.data.version
+        });
+        if (!step.data.ok || step.data.version !== curSync.data.version + 1) {
+          throw new Error(step.data.error || "Bot turn did not advance by one move");
+        }
+        botMoves++;
       } else {
         // Human's turn: play a card or pass!
         const myHand = curG.players[curSync.data.mySeat].hand;
@@ -98,21 +104,24 @@ const server = app.listen(0, async () => {
         const actRes = await post(`/api/game/${roomId}/action`, {
           playerId: p1Id,
           action,
-          payload
+          payload,
+          version: curSync.data.version
         });
         console.log("Human action status:", actRes.status, "ok:", actRes.data.ok);
         if (!actRes.data.ok) {
-          console.error("Action error:", actRes.data.error);
+          throw new Error(actRes.data.error || "Human turn did not advance");
         }
       }
       rounds++;
     }
 
-    console.log("\n>>> CPU / BOT EXECUTION TEST PASSED 100%! BOTS PLAY AUTOMATICALLY! <<<");
+    if (!botMoves) throw new Error("No bot turns were exercised");
+    console.log(`\n>>> CPU / BOT EXECUTION PASSED (${botMoves} bot moves) <<<`);
   } catch (err) {
     console.error("Test failed:", err);
+    process.exitCode = 1;
   } finally {
     server.close();
-    process.exit(0);
+    await pool.end();
   }
 });

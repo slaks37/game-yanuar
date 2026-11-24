@@ -1,6 +1,6 @@
-# Carena 16-Bit — Online PvP Multiplayer Kartu (4–8 Pemain)
+# Carena 16-Bit — Online PvP Multiplayer Kartu (2–8 Pemain)
 
-Revamped version of **Carena 16-Bit** featuring real-time online PvP multiplayer, authoritative server rules, Neon PostgreSQL database integration, and deployment to Vercel connected to `game.newsystem.space`.
+**Carena 16-Bit** adalah game kartu multiplayer online. Server menjalankan aturan permainan dan menyimpan status meja di PostgreSQL. [Main Carena 16-Bit](https://carena-game.vercel.app/)
 
 ---
 
@@ -18,7 +18,7 @@ Revamped version of **Carena 16-Bit** featuring real-time online PvP multiplayer
      - 🎰 **Blackjack 21** (Lawan Bandar dengan aksi Hit, Stand, dan Double)
    - Sistem Ruangan Mabar (Room Browser, Kode Unik #KRT-XXXX, Password Protection).
    - Ruang Tunggu (Lounge) dengan status "SIAP", tombol "Isi Bot" jika ingin langsung main dengan teman + AI, dan salin link undangan (`?join=KRT-XXXX`).
-   - Server-Sent Events (SSE) streaming real-time + fallback polling untuk sinkronisasi turn, kartu meja, chat, dan emote.
+   - Browser mengambil status meja dan event terbaru dari API secara berkala. Data di PostgreSQL menyinkronkan giliran, kartu meja, chat, dan emote antar pemain.
    - Anti-Cheat Hand Protection (kartu rahasia lawan disembunyikan oleh server dari inspeksi browser).
 
 2. **Database Neon PostgreSQL**:
@@ -26,36 +26,35 @@ Revamped version of **Carena 16-Bit** featuring real-time online PvP multiplayer
    - Tabel: `players`, `rooms`, `room_players`, `game_states`, `room_events`.
    - Profil pemain persisten: avatar, bingkai avatar, koin, riwayat kemenangan, dan peringkat leaderboard live.
 
-3. **Deploy Vercel & Domain `game.newsystem.space`**:
-   - Vercel Project: `carena-game` (Team: `slaks37s-projects`).
-   - Production URL Vercel: `https://carena-game-dulwcig7r-slaks37s-projects.vercel.app`
-   - Custom Domain: `game.newsystem.space`
-
----
-
-## 🌐 Konfigurasi DNS Cloudflare untuk `game.newsystem.space`
-
-Domain `newsystem.space` dikelola melalui nameserver Cloudflare (`melinda.ns.cloudflare.com` & `nitin.ns.cloudflare.com`).
-Untuk mengarahkan subdomain `game.newsystem.space` ke Vercel:
-
-1. Buka dashboard Cloudflare: **newsystem.space** > **DNS** > **Records**.
-2. Tambahkan record CNAME:
-   - **Type**: `CNAME`
-   - **Name**: `game`
-   - **Target**: `8dd2b9623448f801.vercel-dns-017.com` (atau `cname.vercel-dns.com`)
-   - **Proxy status**: `DNS only` (Abu-abu / Gray Cloud) untuk penerbitan sertifikat SSL otomatis oleh Vercel.
-3. Atau gunakan tautan Domain Connect Vercel otomatis:
-   `https://vercel.com/api/v9/projects/prj_dvqup0VzMZcjFC0yggfzjtYuCTKK/domains/game.newsystem.space/domain-connect/apply?teamId=team_SCDxbr7VMTFUyI60ki7xaNmg`
-
 ---
 
 ## 💻 Menjalankan Secara Lokal
 
-```bash
-# 1. Install dependencies
-npm install
+Siapkan database PostgreSQL khusus pengembangan. Buat file `.env` di root proyek dan isi `DATABASE_URL` dengan string koneksi database tersebut. Untuk Neon, salin string koneksi dari dashboard dan pertahankan parameter SSL-nya. Untuk PostgreSQL lokal yang berjalan tanpa TLS, tambahkan `?sslmode=disable` pada URL koneksi.
 
-# 2. Jalankan server lokal
-npm run dev # atau node server.js
+```bash
+npm ci
+npm run init-db
+npm run dev
 ```
-Buka browser di `http://localhost:3000`.
+
+Buka [localhost:3000](http://localhost:3000/) dari dua profil browser untuk menguji mabar dengan identitas pemain yang berbeda. Jalankan `npm test` untuk menguji aturan permainan dan klien. Jalankan `npm run test:multiplayer` terhadap database uji yang sudah diinisialisasi untuk menguji alur melalui API.
+
+## Deploy Manual ke Vercel
+
+Proyek Vercel `carena-game` memakai deployment melalui CLI. Setelah perubahan di-push ke GitHub, jalankan langkah berikut dari checkout yang sudah diuji. Pastikan environment Production pada proyek tersebut berisi `DATABASE_URL` dan database sudah diinisialisasi.
+
+```bash
+vercel_scope='nama-scope-vercel'
+vercel project inspect carena-game --scope "$vercel_scope"
+candidate_url=$(vercel deploy --project carena-game --scope "$vercel_scope" --prod --skip-domain)
+vercel inspect "$candidate_url" --scope "$vercel_scope"
+vercel curl /api/health --deployment "$candidate_url" --scope "$vercel_scope" -- --fail --silent --show-error
+```
+
+Setelah deployment siap, health check mengembalikan `ok: true`, dan pengujian mabar berhasil, promosikan kandidat dan cek alamat publik.
+
+```bash
+vercel promote "$candidate_url" --scope "$vercel_scope"
+curl --fail --silent --show-error https://carena-game.vercel.app/api/health
+```

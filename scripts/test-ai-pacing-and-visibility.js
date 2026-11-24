@@ -79,17 +79,13 @@ async function concurrentBotTest() {
     ]
   });
   let stored = original();
-  const query = async (sql, values) => {
-    if (sql.startsWith('UPDATE game_states')) {
-      if (values[2] !== version) return { rows: [] };
-      stored = JSON.parse(values[0]);
-      return { rows: [{ version: ++version }] };
-    }
-    if (sql.startsWith('SELECT state, version')) {
-      return { rows: [{ state: stored, version }] };
-    }
-    throw new Error('Unexpected SQL: ' + sql);
+  const persistMove = async (_roomId, game, expectedVersion, action, move) => {
+    if (expectedVersion !== version) return null;
+    stored = structuredClone(game);
+    events.push({ type: 'GAME_UPDATE', payload: { action, move } });
+    return { game: stored, version: ++version };
   };
+  const readStoredGame = async () => ({ game: stored, version });
   const processGameAction = (game, seat) => {
     game.players[seat].hand = [];
     game.turn = 1;
@@ -99,16 +95,14 @@ async function concurrentBotTest() {
     return { ok: true, g: game };
   };
   const makeRunner = new Function(
-    'query', 'getBotDecision', 'processGameAction',
-    'recordRoomEvent', 'triggerBotMoveReaction', 'handleGameOver',
+    'persistMove', 'readStoredGame', 'getBotDecision', 'processGameAction', 'triggerBotMoveReaction',
     botFunctions + '\nreturn runBotTurnsIfNeeded;'
   );
   const run = makeRunner(
-    query,
+    persistMove, readStoredGame,
     () => ({ action: 'play', payload: { cardId: '7D' } }),
     processGameAction,
-    async (_roomId, type, payload) => { events.push({ type, payload }); },
-    async () => {}, async () => {}
+    async () => {}
   );
   const result = await Promise.all([run('room_1', original(), 1), run('room_1', original(), 1)]);
   assert.equal(version, 2, 'Two concurrent requests must commit exactly once');

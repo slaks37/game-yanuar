@@ -1,6 +1,6 @@
 require('dotenv').config();
 const app = require("../server.js");
-const { query } = require("../lib/db");
+const { pool, query } = require("../lib/db");
 
 const server = app.listen(0, async () => {
   const port = server.address().port;
@@ -24,11 +24,11 @@ const server = app.listen(0, async () => {
   try {
     console.log("=== TEST 1: TURN SYNCHRONIZATION BETWEEN PLAYER 1 AND PLAYER 2 ===");
     const p1User = "p1_" + Math.random().toString(36).substring(7);
-    const reg1 = await post("/api/auth/register", { username: p1User, password: "password123", displayName: "Pemain Satu" });
+    const reg1 = await post("/api/auth/register", { username: p1User, password: "password123", name: "Pemain Satu" });
     const p1Id = reg1.data.player.id;
 
     const p2User = "p2_" + Math.random().toString(36).substring(7);
-    const reg2 = await post("/api/auth/register", { username: p2User, password: "password123", displayName: "Pemain Dua" });
+    const reg2 = await post("/api/auth/register", { username: p2User, password: "password123", name: "Pemain Dua" });
     const p2Id = reg2.data.player.id;
 
     const crRes = await post("/api/rooms", {
@@ -40,8 +40,10 @@ const server = app.listen(0, async () => {
     const roomId = crRes.data.room.id;
     const roomCode = crRes.data.room.code;
 
-    await post(`/api/rooms/${roomCode}/join`, { playerId: p2Id });
-    await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
+    const joined = await post(`/api/rooms/${roomCode}/join`, { playerId: p2Id });
+    if (!joined.data.ok) throw new Error(joined.data.error || "Failed to join room");
+    const started = await post(`/api/rooms/${roomId}/start`, { hostId: p1Id });
+    if (!started.data.ok) throw new Error(started.data.error || "Failed to start game");
 
     // Sync P1
     const p1Sync = await get(`/api/game/${roomId}/sync?playerId=${p1Id}`);
@@ -65,8 +67,10 @@ const server = app.listen(0, async () => {
     const playRes = await post(`/api/game/${roomId}/action`, {
       playerId: activePlayerId,
       action: "play",
-      payload: { cardIds: [card3D.id] }
+      payload: { cardIds: [card3D.id] },
+      version: p1Sync.data.version
     });
+    if (!playRes.data.ok) throw new Error(playRes.data.error || "Opening move failed");
     console.log("Play result status:", playRes.status, "ok:", playRes.data.ok);
 
     // Now verify turn passed to the other player!
@@ -101,7 +105,7 @@ const server = app.listen(0, async () => {
     if (turnAfterTimeout !== turnBeforeTimeout) {
       console.log("[PASS] 60-second AFK timeout automatically passed/moved and advanced the turn!");
     } else {
-      console.log("Turn didn't advance, status:", syncTimeoutRes.data.game.status);
+      throw new Error(`Timed-out turn did not advance: ${syncTimeoutRes.data.game.status}`);
     }
 
     console.log("\n=== TEST 3: 7-MINUTE INACTIVITY AUTO CLEANUP ===");
@@ -125,6 +129,7 @@ const server = app.listen(0, async () => {
 
     console.log("\n=== TEST 4: MANUAL ROOM DELETION ===");
     const delRes = await post(`/api/rooms/${roomId}/delete`, { playerId: p1Id });
+    if (!delRes.data.ok) throw new Error(delRes.data.error || "Failed to delete room");
     console.log("Host deleted room status:", delRes.status, delRes.data);
     const roomsAfterDel = await get("/api/rooms");
     const foundDel = roomsAfterDel.data.rooms.find(r => r.id === roomId);
@@ -140,8 +145,9 @@ const server = app.listen(0, async () => {
     console.log("==========================================");
   } catch (err) {
     console.error("Test error:", err);
+    process.exitCode = 1;
   } finally {
     server.close();
-    process.exit(0);
+    await pool.end();
   }
 });
